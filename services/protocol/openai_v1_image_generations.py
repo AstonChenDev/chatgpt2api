@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from typing import Any, Iterator
 
 from services.protocol.conversation import (
@@ -14,7 +13,11 @@ from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 
 def _decode_images(raw: Any) -> list[str]:
-    """Decode image field (single base64 string or list) into base64 strings."""
+    """Normalize image field into a list of image references.
+
+    Each item may be a base64 string, a data-url, or an HTTP(S) URL.
+    Data-url headers are stripped; URLs and plain base64 are passed through as-is.
+    """
     if not raw:
         return []
     items = raw if isinstance(raw, list) else [raw]

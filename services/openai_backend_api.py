@@ -874,7 +874,11 @@ class OpenAIBackendAPI:
         return response.json().get("conduit_token", "")
 
     def _decode_image_base64(self, image: str) -> bytes:
-        """把 base64 图片字符串或本地路径解码成二进制。"""
+        """把 base64 图片字符串、本地路径或 HTTP(S) URL 解码成二进制。"""
+        # HTTP(S) URL — download the image
+        if image.startswith(("http://", "https://")):
+            return self._download_image_url(image)
+        # Short non-data-url string — try as local file path
         if (
                 image
                 and len(image) < 512
@@ -885,13 +889,50 @@ class OpenAIBackendAPI:
             file_path = Path(os.path.expanduser(image))
             if file_path.exists() and file_path.is_file():
                 return file_path.read_bytes()
+        # Base64 (with or without data-url header)
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
         return base64.b64decode(payload)
 
+    def _download_image_url(self, url: str) -> bytes:
+        """下载 HTTP(S) 图片 URL，返回二进制内容。"""
+        max_size = 20 * 1024 * 1024  # 20 MB
+        logger.info({"event": "image_url_download", "url": url})
+        try:
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": self.user_agent,
+                    "Accept": "image/*,*/*;q=0.8",
+                },
+                timeout=60,
+                verify=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"failed to download image from URL: {url}: {exc}") from exc
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"failed to download image from URL (HTTP {response.status_code}): {url}"
+            )
+        data = response.content
+        if not data:
+            raise RuntimeError(f"downloaded image is empty: {url}")
+        if len(data) > max_size:
+            raise RuntimeError(
+                f"image exceeds maximum size ({max_size // (1024 * 1024)}MB): {url}"
+            )
+        logger.info({"event": "image_url_downloaded", "url": url, "size": len(data)})
+        return data
+
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
-        """上传一张 base64 图片，返回底层文件元数据。"""
+        """上传一张图片（base64 / 本地路径 / URL），返回底层文件元数据。"""
         data = self._decode_image_base64(image)
-        if (
+        # Infer a meaningful filename from URL path
+        if image.startswith(("http://", "https://")):
+            url_path = image.split("?", 1)[0].split("#", 1)[0]
+            url_basename = url_path.rsplit("/", 1)[-1]
+            if "." in url_basename:
+                file_name = url_basename
+        elif (
                 image
                 and len(image) < 512
                 and not image.startswith("data:")
