@@ -30,6 +30,7 @@ class ImageGenerationRequest(BaseModel):
     response_format: str = "b64_json"
     history_disabled: bool = True
     stream: bool | None = None
+    image: str | list[str] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -97,7 +98,8 @@ def create_router() -> APIRouter:
         identity = require_identity(authorization)
         payload = body.model_dump(mode="python")
         payload["base_url"] = resolve_image_base_url(request)
-        call = LoggedCall(identity, "/v1/images/generations", body.model, "文生图", request_text=body.prompt)
+        has_image = bool(body.image)
+        call = LoggedCall(identity, "/v1/images/generations", body.model, "图生图" if has_image else "文生图", request_text=body.prompt)
         await filter_or_log(call, body.prompt)
         return await call.run(openai_v1_image_generations.handle, payload)
 
