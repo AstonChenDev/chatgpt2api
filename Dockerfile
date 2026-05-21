@@ -7,7 +7,7 @@ FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
 WORKDIR /app/web
 
 COPY web/package.json web/bun.lock ./
-RUN npm install
+RUN npm config set registry https://registry.npmmirror.com && npm install
 
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
@@ -26,10 +26,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
+# 使用国内 USTC 软件源加速并稳定 Debian 包安装
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources || true \
+    && sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list || true
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
