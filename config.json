@@ -78,6 +78,11 @@
     "webdav_username": "",
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
+    "cos_secret_id": "",
+    "cos_secret_key": "",
+    "cos_region": "",
+    "cos_bucket": "",
+    "cos_path_prefix": "generated/",
     "public_base_url": ""
   },
   "image_min_free_mb": 500,

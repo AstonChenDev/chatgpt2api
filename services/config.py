@@ -34,6 +34,11 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_username": "",
     "webdav_password": "",
     "webdav_root_path": "chatgpt2api/images",
+    "cos_secret_id": "",
+    "cos_secret_key": "",
+    "cos_region": "",
+    "cos_bucket": "",
+    "cos_path_prefix": "generated/",
     "public_base_url": "",
 }
 
@@ -144,12 +149,14 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
 def _normalize_image_storage_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
+    if mode not in {"local", "webdav", "both", "cos"}:
         mode = "local"
     enabled = _normalize_bool(source.get("enabled"), False)
     if not enabled:
         mode = "local"
     root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
+    cos_path_prefix = str(source.get("cos_path_prefix") or DEFAULT_IMAGE_STORAGE["cos_path_prefix"]).strip().strip("/")
+    cos_path_prefix = f"{cos_path_prefix}/" if cos_path_prefix else ""
     return {
         "enabled": enabled,
         "mode": mode,
@@ -157,6 +164,11 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_username": str(source.get("webdav_username") or "").strip(),
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
+        "cos_secret_id": str(source.get("cos_secret_id") or "").strip(),
+        "cos_secret_key": str(source.get("cos_secret_key") or "").strip(),
+        "cos_region": str(source.get("cos_region") or "").strip(),
+        "cos_bucket": str(source.get("cos_bucket") or "").strip(),
+        "cos_path_prefix": cos_path_prefix,
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
     }
 
@@ -290,10 +302,21 @@ def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
-    if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-    if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    mode = str(settings.get("mode") or "local").strip().lower()
+    if mode in {"webdav", "both"}:
+        if not str(settings.get("webdav_url") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
+        if not str(settings.get("webdav_password") or "").strip():
+            raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+    elif mode == "cos":
+        if not str(settings.get("cos_secret_id") or "").strip():
+            raise ValueError("启用 COS 图片存储后必须填写 Secret ID")
+        if not str(settings.get("cos_secret_key") or "").strip():
+            raise ValueError("启用 COS 图片存储后必须填写 Secret Key")
+        if not str(settings.get("cos_region") or "").strip():
+            raise ValueError("启用 COS 图片存储后必须填写 Region（存储桶地域）")
+        if not str(settings.get("cos_bucket") or "").strip():
+            raise ValueError("启用 COS 图片存储后必须填写 Bucket（存储桶名称）")
 
 
 @dataclass(frozen=True)

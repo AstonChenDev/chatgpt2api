@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 from curl_cffi import requests
 from fastapi import HTTPException
 from PIL import Image
+from qcloud_cos import CosConfig, CosS3Client
 
 from services.config import DATA_DIR, config
 
@@ -164,6 +165,81 @@ class WebDAVClient:
             self.session.close()
 
 
+class COSClient:
+    def __init__(self, settings: dict[str, object]):
+        self.secret_id = _clean(settings.get("cos_secret_id"))
+        self.secret_key = _clean(settings.get("cos_secret_key"))
+        self.region = _clean(settings.get("cos_region"))
+        self.bucket = _clean(settings.get("cos_bucket"))
+        self.path_prefix = _clean(settings.get("cos_path_prefix")).strip("/")
+        
+        config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key)
+        self.client = CosS3Client(config_cos)
+
+    def remote_url(self, rel: str) -> str:
+        public_base_url = _clean(config.get_image_storage_settings().get("public_base_url"))
+        safe_rel = _safe_relative_path(rel)
+        prefix = f"{self.path_prefix}/" if self.path_prefix else ""
+        key = f"{prefix}{safe_rel}"
+        if public_base_url:
+            return f"{public_base_url.rstrip('/')}/{key.lstrip('/')}"
+        return f"https://{self.bucket}.cos.{self.region}.myqcloud.com/{key.lstrip('/')}"
+
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+        safe_rel = _safe_relative_path(rel)
+        prefix = f"{self.path_prefix}/" if self.path_prefix else ""
+        key = f"{prefix}{safe_rel}"
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Body=payload,
+                Key=key,
+                EnableMD5=True,
+                ContentType=content_type
+            )
+        except Exception as exc:
+            raise ImageStorageError(f"COS put_object failed: {exc}")
+        return self.remote_url(rel)
+
+    def get(self, rel: str) -> bytes:
+        safe_rel = _safe_relative_path(rel)
+        prefix = f"{self.path_prefix}/" if self.path_prefix else ""
+        key = f"{prefix}{safe_rel}"
+        try:
+            response = self.client.get_object(
+                Bucket=self.bucket,
+                Key=key
+            )
+            fp = response['Body'].get_raw_stream()
+            return fp.read()
+        except Exception as exc:
+            raise ImageStorageError(f"COS get_object failed: {exc}")
+
+    def delete(self, rel: str) -> bool:
+        safe_rel = _safe_relative_path(rel)
+        prefix = f"{self.path_prefix}/" if self.path_prefix else ""
+        key = f"{prefix}{safe_rel}"
+        try:
+            self.client.delete_object(
+                Bucket=self.bucket,
+                Key=key
+            )
+            return True
+        except Exception as exc:
+            raise ImageStorageError(f"COS delete_object failed: {exc}")
+
+    def test(self) -> dict[str, object]:
+        if not self.secret_id or not self.secret_key or not self.region or not self.bucket:
+            return {"ok": False, "status": 0, "error": "COS configuration fields are required"}
+        test_rel = ".chatgpt2api_cos_test.txt"
+        try:
+            self.put(test_rel, b"chatgpt2api cos test\n", content_type="text/plain")
+            self.delete(test_rel)
+            return {"ok": True, "status": 200, "error": None}
+        except Exception as exc:
+            return {"ok": False, "status": 0, "error": str(exc) or exc.__class__.__name__}
+
+
 class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
@@ -191,6 +267,9 @@ class ImageStorageService:
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         settings = self.settings()
+        mode = _clean(settings.get("mode"))
+        if mode == "cos":
+            return COSClient(settings).remote_url(rel)
         public_base_url = _clean(settings.get("public_base_url"))
         if public_base_url:
             return f"{public_base_url.rstrip('/')}/{_safe_relative_path(rel)}"
@@ -206,10 +285,11 @@ class ImageStorageService:
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
-        if mode not in {"local", "webdav", "both"}:
+        if mode not in {"local", "webdav", "both", "cos"}:
             mode = "local"
         stored_local = False
         stored_webdav = False
+        stored_cos = False
         remote_url = ""
 
         if mode in {"local", "both"}:
@@ -222,6 +302,10 @@ class ImageStorageService:
             remote_url = WebDAVClient(self.settings()).put(rel, image_data)
             stored_webdav = True
 
+        if mode == "cos":
+            remote_url = COSClient(self.settings()).put(rel, image_data)
+            stored_cos = True
+
         dimensions = _image_dimensions(image_data)
         item = {
             "rel": rel,
@@ -230,9 +314,10 @@ class ImageStorageService:
             "date": "-".join(rel.split("/")[:3]),
             "size": len(image_data),
             "created_at": _now_iso(),
-            "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
+            "storage": "cos" if stored_cos else ("both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local")),
             "local": stored_local,
             "webdav": stored_webdav,
+            "cos": stored_cos,
             "remote_url": remote_url,
         }
         if dimensions:
@@ -253,6 +338,8 @@ class ImageStorageService:
         item = self._load_clean_index().get(safe_rel, {})
         if item.get("webdav"):
             return WebDAVClient(self.settings()).get(safe_rel)
+        if item.get("cos"):
+            return COSClient(self.settings()).get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
 
     def exists(self, rel: str) -> bool:
@@ -262,7 +349,7 @@ class ImageStorageService:
         if _local_image_path(safe_rel).is_file():
             return True
         item = self._load_clean_index().get(safe_rel, {})
-        return bool(item.get("webdav"))
+        return bool(item.get("webdav")) or bool(item.get("cos"))
 
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
@@ -294,6 +381,7 @@ class ImageStorageService:
                     "storage": "local",
                     "local": True,
                     "webdav": False,
+                    "cos": False,
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 }
                 changed = True
@@ -306,15 +394,26 @@ class ImageStorageService:
                     continue
                 local = _local_image_path(rel).is_file()
                 webdav = bool(item.get("webdav"))
-                if not local and not webdav:
+                cos = bool(item.get("cos"))
+                if not local and not webdav and not cos:
                     indexed.pop(rel, None)
                     changed = True
                     continue
-                storage = "both" if local and webdav else ("webdav" if webdav else "local")
-                if item.get("local") != local or item.get("storage") != storage:
+                
+                if local and webdav:
+                    storage = "both"
+                elif cos:
+                    storage = "cos"
+                elif webdav:
+                    storage = "webdav"
+                else:
+                    storage = "local"
+
+                if item.get("local") != local or item.get("storage") != storage or item.get("cos") != cos:
                     item = {
                         **item,
                         "local": local,
+                        "cos": cos,
                         "storage": storage,
                     }
                     indexed[rel] = item
@@ -351,6 +450,12 @@ class ImageStorageService:
                 except ImageStorageError:
                     if not removed:
                         raise
+            if item.get("cos"):
+                try:
+                    removed = COSClient(self.settings()).delete(safe_rel) or removed
+                except ImageStorageError:
+                    if not removed:
+                        raise
             if safe_rel in items:
                 items.pop(safe_rel, None)
                 self._save_index(items)
@@ -358,48 +463,91 @@ class ImageStorageService:
 
     def sync_all(self) -> dict[str, int]:
         settings = self.settings()
-        if self.mode() not in {"webdav", "both"}:
-            raise ImageStorageError("WebDAV 图片存储未启用")
+        mode = self.mode()
+        if mode not in {"webdav", "both", "cos"}:
+            raise ImageStorageError("网络图片存储（WebDAV/COS）未启用")
         uploaded = 0
         skipped = 0
         failed = 0
         with self._index_lock:
             items = self._load_clean_index()
-            client = WebDAVClient(settings)
-            for path in sorted(config.images_dir.rglob("*")):
-                if not path.is_file() or not _is_image_rel(path.name):
-                    continue
-                rel = path.relative_to(config.images_dir).as_posix()
-                item = items.get(rel, {})
-                if item.get("webdav"):
-                    skipped += 1
-                    continue
-                try:
-                    payload = path.read_bytes()
-                    remote_url = client.put(rel, payload)
-                    dimensions = _image_dimensions(payload)
-                    items[rel] = {
-                        **item,
-                        "rel": rel,
-                        "path": rel,
-                        "name": path.name,
-                        "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
-                        "size": len(payload),
-                        "created_at": str(item.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
-                        "storage": "both",
-                        "local": True,
-                        "webdav": True,
-                        "remote_url": remote_url,
-                        **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
-                    }
-                    uploaded += 1
-                except Exception:
-                    failed += 1
+            if mode == "cos":
+                client = COSClient(settings)
+                for path in sorted(config.images_dir.rglob("*")):
+                    if not path.is_file() or not _is_image_rel(path.name):
+                        continue
+                    rel = path.relative_to(config.images_dir).as_posix()
+                    item = items.get(rel, {})
+                    if item.get("cos"):
+                        skipped += 1
+                        continue
+                    try:
+                        payload = path.read_bytes()
+                        remote_url = client.put(rel, payload)
+                        dimensions = _image_dimensions(payload)
+                        items[rel] = {
+                            **item,
+                            "rel": rel,
+                            "path": rel,
+                            "name": path.name,
+                            "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
+                            "size": len(payload),
+                            "created_at": str(item.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
+                            "storage": "cos",
+                            "local": True,
+                            "webdav": False,
+                            "cos": True,
+                            "remote_url": remote_url,
+                            **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
+                        }
+                        uploaded += 1
+                    except Exception:
+                        failed += 1
+            else:
+                client = WebDAVClient(settings)
+                for path in sorted(config.images_dir.rglob("*")):
+                    if not path.is_file() or not _is_image_rel(path.name):
+                        continue
+                    rel = path.relative_to(config.images_dir).as_posix()
+                    item = items.get(rel, {})
+                    if item.get("webdav"):
+                        skipped += 1
+                        continue
+                    try:
+                        payload = path.read_bytes()
+                        remote_url = client.put(rel, payload)
+                        dimensions = _image_dimensions(payload)
+                        items[rel] = {
+                            **item,
+                            "rel": rel,
+                            "path": rel,
+                            "name": path.name,
+                            "date": "-".join(rel.split("/")[:3]) if len(rel.split("/")) >= 4 else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d"),
+                            "size": len(payload),
+                            "created_at": str(item.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
+                            "storage": "both" if item.get("local") else "webdav",
+                            "local": bool(item.get("local")),
+                            "webdav": True,
+                            "remote_url": remote_url,
+                            **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
+                        }
+                        uploaded += 1
+                    except Exception:
+                        failed += 1
             self._save_index(items)
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
     def test_webdav(self) -> dict[str, object]:
         return WebDAVClient(self.settings()).test()
+
+    def test_cos(self) -> dict[str, object]:
+        return COSClient(self.settings()).test()
+
+    def test_connection(self) -> dict[str, object]:
+        mode = self.mode()
+        if mode == "cos":
+            return self.test_cos()
+        return self.test_webdav()
 
 
 image_storage_service = ImageStorageService()

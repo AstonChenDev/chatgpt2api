@@ -4,7 +4,7 @@ export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both";
+export type ImageStorageMode = "local" | "webdav" | "both" | "cos";
 
 export type ImageStorageSettings = {
   enabled: boolean;
@@ -13,6 +13,11 @@ export type ImageStorageSettings = {
   webdav_username: string;
   webdav_password: string;
   webdav_root_path: string;
+  cos_secret_id?: string;
+  cos_secret_key?: string;
+  cos_region?: string;
+  cos_bucket?: string;
+  cos_path_prefix?: string;
   public_base_url: string;
 };
 
@@ -184,6 +189,7 @@ export type SettingsConfig = {
   backup_state?: BackupState;
   [key: string]: unknown;
 };
+
 
 export type BackupInclude = {
   config: boolean;

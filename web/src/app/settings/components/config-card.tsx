@@ -286,12 +286,12 @@ export function ConfigCard() {
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <label className="flex items-center gap-3 text-sm text-stone-700">
+              <label className="flex items-center gap-3 text-sm text-stone-700 font-medium">
                 <Checkbox
                   checked={Boolean(config?.image_storage?.enabled)}
                   onCheckedChange={(checked) => setImageStorageField("enabled", Boolean(checked))}
                 />
-                启用 WebDAV 图片存储
+                启用第三方图片存储 (WebDAV / COS)
               </label>
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -299,10 +299,10 @@ export function ConfigCard() {
                   variant="outline"
                   className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                   onClick={() => void testImageStorage()}
-                  disabled={isTestingImageStorage || !config?.image_storage?.enabled}
+                  disabled={isTestingImageStorage || !config?.image_storage?.enabled || config?.image_storage?.mode === "local"}
                 >
                   {isTestingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <Cloud className="size-4" />}
-                  测试 WebDAV
+                  测试 {config?.image_storage?.mode === "cos" ? "COS" : "WebDAV"}
                 </Button>
                 <Button
                   type="button"
@@ -317,7 +317,7 @@ export function ConfigCard() {
               </div>
             </div>
             <p className="text-xs leading-6 text-stone-500">
-              生成时只处理本次新图片；全量同步用于把已有本地图片补传到 WebDAV。
+              启用后，新生成的图片将自动同步至第三方存储服务以获得更好的加载体验（如使用腾讯云 CDN 加速）。
             </p>
             <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600">
               当前待保存模式：
@@ -327,13 +327,15 @@ export function ConfigCard() {
                     ? "本机 + WebDAV"
                     : config.image_storage.mode === "webdav"
                       ? "仅 WebDAV"
-                      : "仅本机"
+                      : config.image_storage.mode === "cos"
+                        ? "仅腾讯云 COS"
+                        : "仅本机"
                   : "仅本机"}
               </span>
               <span className="ml-2 text-stone-400">修改后需要点保存，或通过测试/同步按钮自动保存。</span>
             </div>
             <div className="grid gap-4 md:grid-cols-3">
-              <div className="space-y-2">
+              <div className="space-y-2 md:col-span-3">
                 <label className="text-sm text-stone-700">保存模式</label>
                 <Select
                   value={String(config?.image_storage?.mode || "local")}
@@ -347,60 +349,121 @@ export function ConfigCard() {
                     <SelectItem value="local">仅本机</SelectItem>
                     <SelectItem value="webdav">仅 WebDAV</SelectItem>
                     <SelectItem value="both">本机 + WebDAV</SelectItem>
+                    <SelectItem value="cos">仅腾讯云 COS 对象存储</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2 md:col-span-2">
-                <label className="text-sm text-stone-700">WebDAV URL</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_url || "")}
-                  onChange={(event) => setImageStorageField("webdav_url", event.target.value)}
-                  placeholder="https://example.com/dav"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
+            </div>
+
+            {config?.image_storage?.enabled && (config?.image_storage?.mode === "webdav" || config?.image_storage?.mode === "both") && (
+              <div className="grid gap-4 md:grid-cols-3 pt-2 border-t border-stone-100">
+                <div className="space-y-2 md:col-span-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-stone-400">WebDAV 存储配置</span>
+                </div>
+                <div className="space-y-2 md:col-span-3">
+                  <label className="text-sm text-stone-700">WebDAV URL</label>
+                  <Input
+                    value={String(config?.image_storage?.webdav_url || "")}
+                    onChange={(event) => setImageStorageField("webdav_url", event.target.value)}
+                    placeholder="https://example.com/dav"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">用户名</label>
+                  <Input
+                    value={String(config?.image_storage?.webdav_username || "")}
+                    onChange={(event) => setImageStorageField("webdav_username", event.target.value)}
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">密码</label>
+                  <Input
+                    type="password"
+                    value={String(config?.image_storage?.webdav_password || "")}
+                    onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">远端目录</label>
+                  <Input
+                    value={String(config?.image_storage?.webdav_root_path || "")}
+                    onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)}
+                    placeholder="chatgpt2api/images"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
               </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">用户名</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_username || "")}
-                  onChange={(event) => setImageStorageField("webdav_username", event.target.value)}
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
+            )}
+
+            {config?.image_storage?.enabled && config?.image_storage?.mode === "cos" && (
+              <div className="grid gap-4 md:grid-cols-3 pt-2 border-t border-stone-100">
+                <div className="space-y-2 md:col-span-3">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-stone-400">腾讯云 COS 存储配置</span>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">COS Secret ID</label>
+                  <Input
+                    value={String(config?.image_storage?.cos_secret_id || "")}
+                    onChange={(event) => setImageStorageField("cos_secret_id", event.target.value)}
+                    placeholder="AKID..."
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2 md:col-span-2">
+                  <label className="text-sm text-stone-700">COS Secret Key</label>
+                  <Input
+                    type="password"
+                    value={String(config?.image_storage?.cos_secret_key || "")}
+                    onChange={(event) => setImageStorageField("cos_secret_key", event.target.value)}
+                    placeholder="Secret Key"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">Region (所属地域)</label>
+                  <Input
+                    value={String(config?.image_storage?.cos_region || "")}
+                    onChange={(event) => setImageStorageField("cos_region", event.target.value)}
+                    placeholder="ap-guangzhou"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">Bucket (存储桶名称)</label>
+                  <Input
+                    value={String(config?.image_storage?.cos_bucket || "")}
+                    onChange={(event) => setImageStorageField("cos_bucket", event.target.value)}
+                    placeholder="my-bucket-123456"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-stone-700">Path Prefix (路径前缀)</label>
+                  <Input
+                    value={String(config?.image_storage?.cos_path_prefix || "")}
+                    onChange={(event) => setImageStorageField("cos_path_prefix", event.target.value)}
+                    placeholder="generated/"
+                    className="h-10 rounded-xl border-stone-200 bg-white"
+                  />
+                </div>
               </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">密码</label>
-                <Input
-                  type="password"
-                  value={String(config?.image_storage?.webdav_password || "")}
-                  onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm text-stone-700">远端目录</label>
-                <Input
-                  value={String(config?.image_storage?.webdav_root_path || "")}
-                  onChange={(event) => setImageStorageField("webdav_root_path", event.target.value)}
-                  placeholder="chatgpt2api/images"
-                  className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
-                />
-              </div>
-              <div className="space-y-2 md:col-span-3">
-                <label className="text-sm text-stone-700">公开访问前缀</label>
+            )}
+
+            {config?.image_storage?.enabled && config?.image_storage?.mode !== "local" && (
+              <div className="space-y-2 pt-2 border-t border-stone-100">
+                <label className="text-sm text-stone-700">公开访问前缀 (CDN / 自定义域名)</label>
                 <Input
                   value={String(config?.image_storage?.public_base_url || "")}
                   onChange={(event) => setImageStorageField("public_base_url", event.target.value)}
-                  placeholder="https://cdn.example.com/chatgpt2api/images"
+                  placeholder={config?.image_storage?.mode === "cos" ? "https://gcli-1329603706.cos.na-siliconvalley.myqcloud.com" : "https://cdn.example.com/chatgpt2api/images"}
                   className="h-10 rounded-xl border-stone-200 bg-white"
-                  disabled={!config?.image_storage?.enabled}
                 />
-                <p className="text-xs text-stone-500">留空时返回本应用 /images/... 代理地址；填入后直接返回公开图片地址。</p>
+                <p className="text-xs text-stone-500">填入腾讯云 COS 的访问域名或自定义 CDN 域名。留空时默认返回 /images/... 代理地址。</p>
               </div>
-            </div>
+            )}
           </div>
           <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
             <label className="flex items-center gap-3 text-sm text-stone-700">

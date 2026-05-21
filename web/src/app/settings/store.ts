@@ -131,13 +131,20 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_username: "",
       webdav_password: "",
       webdav_root_path: "chatgpt2api/images",
+      cos_secret_id: "",
+      cos_secret_key: "",
+      cos_region: "",
+      cos_bucket: "",
+      cos_path_prefix: "generated/",
       public_base_url: "",
     };
   const imageStorageMode: ImageStorageMode = imageStorage.enabled && imageStorage.mode === "both"
     ? "both"
     : imageStorage.enabled && imageStorage.mode === "webdav"
       ? "webdav"
-      : "local";
+      : imageStorage.enabled && imageStorage.mode === "cos"
+        ? "cos"
+        : "local";
   const backup = typeof config.backup === "object" && config.backup
     ? config.backup as BackupSettings
     : {
@@ -196,6 +203,11 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       webdav_username: String(imageStorage.webdav_username || ""),
       webdav_password: String(imageStorage.webdav_password || ""),
       webdav_root_path: String(imageStorage.webdav_root_path || "chatgpt2api/images"),
+      cos_secret_id: String(imageStorage.cos_secret_id || ""),
+      cos_secret_key: String(imageStorage.cos_secret_key || ""),
+      cos_region: String(imageStorage.cos_region || ""),
+      cos_bucket: String(imageStorage.cos_bucket || ""),
+      cos_path_prefix: String(imageStorage.cos_path_prefix || "generated/"),
       public_base_url: String(imageStorage.public_base_url || ""),
     },
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
@@ -435,11 +447,16 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
         image_storage: {
           enabled: Boolean(config.image_storage?.enabled),
-          mode: config.image_storage?.enabled && ["webdav", "both"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
+          mode: config.image_storage?.enabled && ["webdav", "both", "cos"].includes(String(config.image_storage?.mode)) ? config.image_storage.mode : "local",
           webdav_url: String(config.image_storage?.webdav_url || "").trim(),
           webdav_username: String(config.image_storage?.webdav_username || "").trim(),
           webdav_password: String(config.image_storage?.webdav_password || "").trim(),
           webdav_root_path: String(config.image_storage?.webdav_root_path || "chatgpt2api/images").trim(),
+          cos_secret_id: String(config.image_storage?.cos_secret_id || "").trim(),
+          cos_secret_key: String(config.image_storage?.cos_secret_key || "").trim(),
+          cos_region: String(config.image_storage?.cos_region || "").trim(),
+          cos_bucket: String(config.image_storage?.cos_bucket || "").trim(),
+          cos_path_prefix: String(config.image_storage?.cos_path_prefix || "generated/").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
         },
         proxy_runtime: {
@@ -717,14 +734,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       if (!saved) {
         return;
       }
+      const mode = get().config?.image_storage?.mode || "local";
+      const modeName = mode === "cos" ? "COS 对象存储" : "WebDAV";
       const data = await testImageStorageConnection();
       if (data.result.ok) {
-        toast.success(`WebDAV 连接可用：HTTP ${data.result.status}`);
+        toast.success(`${modeName} 连接可用：HTTP ${data.result.status}`);
       } else {
-        toast.error(`WebDAV 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
+        toast.error(`${modeName} 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
+      const mode = get().config?.image_storage?.mode || "local";
+      const modeName = mode === "cos" ? "COS 对象存储" : "WebDAV";
+      toast.error(error instanceof Error ? error.message : `测试 ${modeName} 失败`);
     } finally {
       set({ isTestingImageStorage: false });
     }
