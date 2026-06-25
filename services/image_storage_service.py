@@ -173,9 +173,14 @@ class COSClient:
         self.region = _clean(settings.get("cos_region"))
         self.bucket = _clean(settings.get("cos_bucket"))
         self.path_prefix = _clean(settings.get("cos_path_prefix")).strip("/")
-        
-        config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key, Timeout=30)
-        self.client = CosS3Client(config_cos)
+        self._client = None
+
+    @property
+    def client(self) -> CosS3Client:
+        if self._client is None:
+            config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key, Timeout=30)
+            self._client = CosS3Client(config_cos)
+        return self._client
 
     def remote_url(self, rel: str) -> str:
         public_base_url = _clean(config.get_image_storage_settings().get("public_base_url"))
