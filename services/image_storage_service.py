@@ -16,6 +16,7 @@ from PIL import Image
 from qcloud_cos import CosConfig, CosS3Client
 
 from services.config import DATA_DIR, config
+from utils.log import logger
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
@@ -173,7 +174,7 @@ class COSClient:
         self.bucket = _clean(settings.get("cos_bucket"))
         self.path_prefix = _clean(settings.get("cos_path_prefix")).strip("/")
         
-        config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key)
+        config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key, Timeout=30)
         self.client = CosS3Client(config_cos)
 
     def remote_url(self, rel: str) -> str:
@@ -265,9 +266,9 @@ class ImageStorageService:
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
 
-    def _public_url(self, rel: str, base_url: str | None = None) -> str:
+    def _public_url(self, rel: str, base_url: str | None = None, storage_mode: str | None = None) -> str:
         settings = self.settings()
-        mode = _clean(settings.get("mode"))
+        mode = storage_mode or _clean(settings.get("mode"))
         if mode == "cos":
             return COSClient(settings).remote_url(rel)
         public_base_url = _clean(settings.get("public_base_url"))
@@ -299,12 +300,29 @@ class ImageStorageService:
             stored_local = True
 
         if mode in {"webdav", "both"}:
-            remote_url = WebDAVClient(self.settings()).put(rel, image_data)
-            stored_webdav = True
+            try:
+                remote_url = WebDAVClient(self.settings()).put(rel, image_data)
+                stored_webdav = True
+            except Exception as exc:
+                if mode == "both":
+                    logger.warning(f"WebDAV upload failed: {exc}")
+                else:
+                    logger.warning(f"WebDAV upload failed, fallback to local storage: {exc}")
+                    path = _local_image_path(rel)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(image_data)
+                    stored_local = True
 
         if mode == "cos":
-            remote_url = COSClient(self.settings()).put(rel, image_data)
-            stored_cos = True
+            try:
+                remote_url = COSClient(self.settings()).put(rel, image_data)
+                stored_cos = True
+            except Exception as exc:
+                logger.warning(f"COS upload failed, fallback to local storage: {exc}")
+                path = _local_image_path(rel)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(image_data)
+                stored_local = True
 
         dimensions = _image_dimensions(image_data)
         item = {
@@ -326,7 +344,7 @@ class ImageStorageService:
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
-        return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
+        return StoredImage(rel=rel, url=self._public_url(rel, base_url, storage_mode=str(item["storage"])), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
         safe_rel = _safe_relative_path(rel)
@@ -427,7 +445,7 @@ class ImageStorageService:
                     **item,
                     "rel": rel,
                     "path": rel,
-                    "url": self._public_url(rel, base_url),
+                    "url": self._public_url(rel, base_url, storage_mode=str(item.get("storage"))),
                 })
             if changed:
                 self._save_index(indexed)
