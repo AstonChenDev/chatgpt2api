@@ -178,8 +178,16 @@ def ensure_ok(response: requests.Response, context: str) -> None:
     if 200 <= response.status_code < 300:
         return
     body: Any = response.text
+    if not body and hasattr(response, "iter_content"):
+        try:
+            body = b"".join(response.iter_content()).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
     try:
-        body = response.json()
+        if isinstance(body, str):
+            body = json.loads(body)
+        else:
+            body = response.json()
     except Exception:
         pass
     retry_after_header = response.headers.get("Retry-After") if hasattr(response, "headers") else None
