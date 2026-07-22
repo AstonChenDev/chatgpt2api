@@ -42,6 +42,17 @@ DEFAULT_IMAGE_STORAGE = {
     "public_base_url": "",
 }
 
+IMAGE_STORAGE_ENV_VARS = {
+    "enabled": "CHATGPT2API_IMAGE_STORAGE_ENABLED",
+    "mode": "CHATGPT2API_IMAGE_STORAGE_MODE",
+    "cos_secret_id": "CHATGPT2API_COS_SECRET_ID",
+    "cos_secret_key": "CHATGPT2API_COS_SECRET_KEY",
+    "cos_region": "CHATGPT2API_COS_REGION",
+    "cos_bucket": "CHATGPT2API_COS_BUCKET",
+    "cos_path_prefix": "CHATGPT2API_COS_PATH_PREFIX",
+    "public_base_url": "CHATGPT2API_IMAGE_PUBLIC_BASE_URL",
+}
+
 DEFAULT_CHAT_COMPLETION_CACHE = {
     "enabled": True,
     "ttl_seconds": 60,
@@ -171,6 +182,20 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "cos_path_prefix": cos_path_prefix,
         "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
     }
+
+
+def _image_storage_settings_with_env(value: object) -> dict[str, object]:
+    """Return image storage settings with non-empty environment overrides.
+
+    Keeping blank values as "not configured" lets docker-compose.local.yml
+    declare all supported variables without disabling config.json fallback.
+    """
+    source = dict(value) if isinstance(value, dict) else {}
+    for key, env_name in IMAGE_STORAGE_ENV_VARS.items():
+        env_value = os.getenv(env_name)
+        if env_value is not None and env_value.strip():
+            source[key] = env_value
+    return _normalize_image_storage_settings(source)
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
@@ -647,7 +672,7 @@ class ConfigStore:
         return _normalize_backup_settings(self.data.get("backup"))
 
     def get_image_storage_settings(self) -> dict[str, object]:
-        return _normalize_image_storage_settings(self.data.get("image_storage"))
+        return _image_storage_settings_with_env(self.data.get("image_storage"))
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
