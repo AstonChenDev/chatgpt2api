@@ -12,6 +12,7 @@ import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
 import { ImportBrowserDialog } from "./components/import-browser-dialog";
+import { ImageTaskRuntimeCard } from "./components/image-task-runtime-card";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { Sub2APIConnections } from "./components/sub2api-connections";
@@ -90,7 +91,10 @@ function SettingsPageContent() {
           </TabsList>
         </div>
         <TabsContent value="basic">
-          <ConfigCard />
+          <div className="space-y-4">
+            <ImageTaskRuntimeCard />
+            <ConfigCard />
+          </div>
         </TabsContent>
         <TabsContent value="proxy">
           <ProxyRuntimeCard />

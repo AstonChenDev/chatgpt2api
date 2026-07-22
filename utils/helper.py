@@ -5,14 +5,18 @@ import mimetypes
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 from urllib.parse import urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlOpt, requests
 from fastapi import HTTPException
 from services.proxy_service import proxy_settings
 from utils.log import logger
+
+if TYPE_CHECKING:
+    from services.image_task_runtime import ImageTaskDeadline
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
@@ -30,6 +34,30 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+MAX_MESSAGE_IMAGE_COUNT = 4
+MAX_MESSAGE_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+
+
+@dataclass
+class MessageImageBudget:
+    """一次对话请求共享的视觉输入预算，跨全部历史消息累计。"""
+
+    max_images: int = MAX_MESSAGE_IMAGE_COUNT
+    max_total_bytes: int = MAX_MESSAGE_IMAGE_TOTAL_BYTES
+    image_count: int = 0
+    total_bytes: int = 0
+
+    def ensure_slot(self) -> None:
+        if self.image_count >= self.max_images:
+            raise HTTPException(status_code=400, detail={"error": "一次请求最多支持 4 张输入图片"})
+
+    def consume(self, image: tuple[bytes, str]) -> None:
+        data, _mime = image
+        next_total = self.total_bytes + len(data)
+        if next_total > self.max_total_bytes:
+            raise HTTPException(status_code=400, detail={"error": "输入图片总大小不能超过 50MB"})
+        self.image_count += 1
+        self.total_bytes = next_total
 
 
 def _image_extension(mime_type: str) -> str:
@@ -234,16 +262,49 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
-def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
-    for raw_line in response.iter_lines():
-        if not raw_line:
+def iter_sse_payloads(
+    response: requests.Response,
+    *,
+    max_total_bytes: int = 64 * 1024 * 1024,
+    max_line_bytes: int = 32 * 1024 * 1024,
+) -> Iterator[str]:
+    """增量解析 SSE，并限制总响应及单行大小。
+
+    图片事件可能包含较大的 JSON/base64，不能使用会为单行无限缓冲的默认解析器；
+    显式上限可防止异常上游在截止时间内快速灌入数据造成 OOM。
+    """
+
+    buffer = bytearray()
+    total = 0
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if not chunk:
             continue
-        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
-        if not line.startswith("data:"):
-            continue
-        payload = line[5:].strip()
-        if payload:
-            yield payload
+        total += len(chunk)
+        if total > max_total_bytes:
+            raise RuntimeError("upstream SSE response exceeds 64MB limit")
+        buffer.extend(chunk)
+        while True:
+            newline = buffer.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(buffer[:newline]).rstrip(b"\r")
+            del buffer[: newline + 1]
+            if len(raw_line) > max_line_bytes:
+                raise RuntimeError("upstream SSE event exceeds 32MB limit")
+            if not raw_line.startswith(b"data:"):
+                continue
+            payload = raw_line[5:].strip().decode("utf-8", errors="ignore")
+            if payload:
+                yield payload
+        if len(buffer) > max_line_bytes:
+            raise RuntimeError("upstream SSE event exceeds 32MB limit")
+
+    if buffer:
+        raw_line = bytes(buffer).rstrip(b"\r")
+        if raw_line.startswith(b"data:"):
+            payload = raw_line[5:].strip().decode("utf-8", errors="ignore")
+            if payload:
+                yield payload
 
 
 def save_images_from_text(text: str, prefix: str) -> list[Path]:
@@ -307,6 +368,29 @@ def has_response_image_generation_tool(body: dict[str, object]) -> bool:
     return isinstance(tool_choice, dict) and str(tool_choice.get("type") or "").strip() == "image_generation"
 
 
+def count_input_image_references(value: object) -> int:
+    """只检查请求结构，不下载/解码图片；用于把普通视觉请求也送入有界运行时。"""
+
+    if isinstance(value, list):
+        return sum(count_input_image_references(item) for item in value)
+    if not isinstance(value, dict):
+        return 0
+    item_type = str(value.get("type") or "").strip().lower()
+    direct = item_type in {"image", "image_url", "input_image"}
+    if not direct and any(key in value for key in ("image_url", "b64_json", "base64")):
+        direct = True
+    nested = sum(
+        count_input_image_references(item)
+        for key, item in value.items()
+        if key not in {"image_url", "b64_json", "base64", "data", "source"}
+    )
+    return (1 if direct else 0) + nested
+
+
+def has_input_image_references(value: object) -> bool:
+    return count_input_image_references(value) > 0
+
+
 def extract_prompt_from_message_content(content: object) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -334,55 +418,112 @@ def _message_image_url(value: object) -> str:
     return str(value or "").strip()
 
 
-def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
+def _decode_message_image_url(
+    value: object,
+    deadline: "ImageTaskDeadline | None" = None,
+) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
     if source.startswith("data:"):
         header, _, data = source.partition(",")
         mime = header.split(";")[0].removeprefix("data:") or "image/png"
-        return base64.b64decode(data), mime
+        if len(data) > ((MAX_JSON_IMAGE_BYTES + 2) // 3) * 4 + 4:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": "invalid data image URL"}) from exc
+        if len(decoded) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+        return decoded, mime
     if not source.startswith(("http://", "https://")):
         return None
     parsed = urlparse(source)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
+    from services.deadline_http import DeadlineSession
+    from services.image_task_runtime import ImageTaskRuntimeError
+
+    session: DeadlineSession | None = None
+    response = None
     try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
+        request_kwargs = {
+            "headers": {"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
+            "timeout": REMOTE_IMAGE_TIMEOUT_SECONDS,
+            "stream": True,
+            "allow_redirects": True,
             **proxy_settings.build_session_kwargs(),
-        )
+        }
+        if deadline is None:
+            # 保留普通文本/视觉链路原有的 requests.get 调用形态，便于上游测试、
+            # 插件和部署方 monkeypatch；同时显式设置 libcurl 总时限，慢速滴流也
+            # 不能无限占用请求处理线程。
+            request_kwargs["curl_options"] = {
+                CurlOpt.TIMEOUT_MS: int(REMOTE_IMAGE_TIMEOUT_SECONDS * 1000),
+            }
+            response = requests.get(source, **request_kwargs)
+        else:
+            session = DeadlineSession(image_deadline=deadline)
+            response = session.get(source, **request_kwargs)
+    except ImageTaskRuntimeError:
+        if session is not None:
+            session.close()
+        raise
     except Exception as exc:
+        if session is not None:
+            session.close()
         raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
-    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
-        mime = guessed_mime
-    if not mime.startswith("image/"):
-        mime = "image/png"
-    return image_data, mime
+    try:
+        if not 200 <= response.status_code < 300:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+        content_length = str(response.headers.get("content-length") or "").strip()
+        if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+        chunks: list[bytes] = []
+        total = 0
+        iter_content = getattr(response, "iter_content", None)
+        chunks_iter = iter_content(chunk_size=64 * 1024) if callable(iter_content) else (response.content,)
+        for chunk in chunks_iter:
+            if deadline is not None:
+                deadline.check("下载对话输入图片")
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_JSON_IMAGE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
+            chunks.append(chunk)
+        image_data = b"".join(chunks)
+        if not image_data:
+            raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+        mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
+        guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
+        if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
+            raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
+        if not mime.startswith("image/") and guessed_mime.startswith("image/"):
+            mime = guessed_mime
+        if not mime.startswith("image/"):
+            mime = "image/png"
+        return image_data, mime
+    finally:
+        close_response = getattr(response, "close", None)
+        if callable(close_response):
+            close_response()
+        if session is not None:
+            session.close()
 
 
-def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:
+def _decode_message_image_object(
+    item: dict[str, object],
+    deadline: "ImageTaskDeadline | None" = None,
+) -> tuple[bytes, str] | None:
     data = item.get("data")
     if isinstance(data, (bytes, bytearray)):
-        return bytes(data), str(item.get("mime") or item.get("mime_type") or "image/png")
+        decoded = bytes(data)
+        if len(decoded) > MAX_JSON_IMAGE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "input image exceeds 10MB limit"})
+        return decoded, str(item.get("mime") or item.get("mime_type") or "image/png")
     for key in ("image_url", "url"):
-        image = _decode_message_image_url(item.get(key))
+        image = _decode_message_image_url(item.get(key), deadline)
         if image:
             return image
     value = item.get("b64_json") or item.get("base64")
@@ -402,26 +543,40 @@ def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] |
     return None
 
 
-def extract_image_from_message_content(content: object) -> list[tuple[bytes, str]]:
+def extract_image_from_message_content(
+    content: object,
+    deadline: "ImageTaskDeadline | None" = None,
+    budget: MessageImageBudget | None = None,
+    *,
+    max_images: int | None = None,
+) -> list[tuple[bytes, str]]:
     if not isinstance(content, list):
         return []
-    images = []
+    images: list[tuple[bytes, str]] = []
+    active_budget = budget or MessageImageBudget()
     for item in content:
+        if max_images is not None and len(images) >= max(0, int(max_images)):
+            break
         if not isinstance(item, dict):
             continue
         item_type = str(item.get("type") or "").strip()
+        image: tuple[bytes, str] | None = None
         if item_type == "image_url":
-            image = _decode_message_image_url(item.get("image_url") or item.get("url") or item)
-            if image:
-                images.append(image)
+            active_budget.ensure_slot()
+            image = _decode_message_image_url(item.get("image_url") or item.get("url") or item, deadline)
         elif item_type in {"input_image", "image"}:
-            image = _decode_message_image_object(item)
-            if image:
-                images.append(image)
+            active_budget.ensure_slot()
+            image = _decode_message_image_object(item, deadline)
+        if image:
+            active_budget.consume(image)
+            images.append(image)
     return images
 
 
-def extract_chat_image(body: dict[str, object]) -> list[tuple[bytes, str]]:
+def extract_chat_image(
+    body: dict[str, object],
+    deadline: "ImageTaskDeadline | None" = None,
+) -> list[tuple[bytes, str]]:
     messages = body.get("messages")
     if not isinstance(messages, list):
         return []
@@ -430,7 +585,7 @@ def extract_chat_image(body: dict[str, object]) -> list[tuple[bytes, str]]:
             continue
         if str(message.get("role") or "").strip().lower() != "user":
             continue
-        images = extract_image_from_message_content(message.get("content"))
+        images = extract_image_from_message_content(message.get("content"), deadline)
         if images:
             return images
     return []

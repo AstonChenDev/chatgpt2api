@@ -5,9 +5,6 @@ import os
 import random
 import re
 import time
-
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
@@ -21,6 +18,9 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
+from services.deadline_http import DeadlineSession
+from services.disk_space_guard import InsufficientDiskSpaceError, ensure_disk_space, guarded_write_chunk
+from services.image_task_runtime import ImageTaskDeadline, ImageTaskRuntimeError
 from services.proxy_service import proxy_settings
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -32,8 +32,12 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImagePollTimeoutError(RuntimeError):
-    pass
+class ImagePollTimeoutError(ImageTaskRuntimeError):
+    """上游轮询阶段超时；对客户端统一映射为 504，而不是误报 502。"""
+
+    status_code = 504
+    error_type = "timeout_error"
+    code = "image_poll_timeout"
 
 
 class ImageContentPolicyError(RuntimeError):
@@ -66,6 +70,8 @@ EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
 EDITABLE_FILE_POLL_INTERVAL_SECS = 5.0
+EDITABLE_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+EDITABLE_ARTIFACT_TOTAL_MAX_BYTES = 384 * 1024 * 1024
 EDITABLE_FILE_CLIENT_VERSION = "prod-bede35f9dcd856d080e012478f0c1031faa2588e"
 EDITABLE_FILE_CLIENT_BUILD_NUMBER = "6631702"
 EDITABLE_FILE_PSD_OUTPUT_DIR = "data/files/psd"
@@ -148,7 +154,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", image_deadline: ImageTaskDeadline | None = None) -> None:
         """初始化后端客户端。
 
         参数：
@@ -158,6 +164,7 @@ class OpenAIBackendAPI:
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
         self.access_token = access_token
+        self.image_deadline = image_deadline
         self.account = account_service.get_account(self.access_token) if self.access_token else {}
         self.account = self.account if isinstance(self.account, dict) else {}
         self.fp = self._build_fp()
@@ -167,7 +174,7 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
+        self.session = DeadlineSession(image_deadline=image_deadline, **proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
             verify=True,
@@ -211,6 +218,19 @@ class OpenAIBackendAPI:
                 session.close()
             except Exception:
                 pass
+
+    def _image_timeout(self, maximum_secs: float, phase: str) -> float:
+        """图片链路取剩余总预算；文本等普通链路保持原阶段超时。"""
+
+        deadline = getattr(self, "image_deadline", None)
+        if deadline is None:
+            return float(maximum_secs)
+        return deadline.network_timeout(maximum_secs, phase)
+
+    def _check_image_deadline(self, phase: str) -> None:
+        deadline = getattr(self, "image_deadline", None)
+        if deadline is not None:
+            deadline.check(phase)
 
     def __del__(self):
         self.close()
@@ -272,16 +292,37 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
+    def _new_parallel_session(self) -> DeadlineSession:
+        """创建同身份的独立会话，避免账号预检的三个请求争抢同一截止线锁。"""
+
+        session = DeadlineSession(
+            image_deadline=self.image_deadline,
+            **proxy_settings.build_session_kwargs(
+                account=self.account,
+                impersonate=self.fp["impersonate"],
+                verify=True,
+            ),
+        )
+        session.headers.update(dict(self.session.headers))
+        try:
+            session.cookies.update(self.session.cookies)
+        except Exception:
+            # 账号预检主要依赖 Authorization；Cookie 复制失败不应破坏兼容链路。
+            pass
+        return session
+
+    def _get_me(self, session: DeadlineSession | None = None) -> Dict[str, Any]:
+        active_session = session or self.session
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = active_session.get(self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _get_conversation_init(self, session: DeadlineSession | None = None) -> Dict[str, Any]:
+        active_session = session or self.session
         path = "/backend-api/conversation/init"
-        response = self.session.post(
+        response = active_session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json"}),
             json={
@@ -296,9 +337,10 @@ class OpenAIBackendAPI:
             self._raise_on_error(response, path)
         return response.json()
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, session: DeadlineSession | None = None) -> Dict[str, Any]:
+        active_session = session or self.session
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+        response = active_session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
                                     timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -319,20 +361,22 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        executor = ThreadPoolExecutor(max_workers=3)
+        sessions: list[DeadlineSession] = []
+        executor: ThreadPoolExecutor | None = None
         try:
-            me_future = executor.submit(self._get_me)
-            init_future = executor.submit(self._get_conversation_init)
-            account_future = executor.submit(self._get_default_account)
+            sessions = [self._new_parallel_session() for _ in range(3)]
+            executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="account-preflight")
+            me_future = executor.submit(self._get_me, sessions[0])
+            init_future = executor.submit(self._get_conversation_init, sessions[1])
+            account_future = executor.submit(self._get_default_account, sessions[2])
             me_payload, init_payload, default_account = me_future.result(), init_future.result(), account_future.result()
-        except (KeyboardInterrupt, SystemExit):
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            if executor is not None:
+                # 子请求线程绝不能在外层图片任务失败后逃逸。即使 SDK 非协作式
+                # 卡住，也要让外层运行时继续持有许可并由进程看门狗统一自愈。
+                executor.shutdown(wait=True, cancel_futures=True)
+            for session in sessions:
+                session.close()
 
         plan_type = str(default_account.get("plan_type") or "free")
 
@@ -697,61 +741,142 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
-        content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
-        status_code = getattr(raw, "status", None)
-        parse_errors: list[str] = []
-        events: list[Dict[str, Any]] = []
-        if "application/json" in content_type:
-            try:
-                data = json.loads(text)
-                if isinstance(data, dict):
-                    events.append(data)
-            except Exception as exc:
-                parse_errors.append(str(exc))
-        else:
-            lines: list[str] = []
-            for line in text.splitlines() + [""]:
-                if not line:
-                    if lines:
-                        payload_text = "\n".join(lines).strip()
-                        if payload_text and payload_text != "[DONE]":
-                            try:
-                                data = json.loads(payload_text)
-                            except Exception as exc:
-                                parse_errors.append(str(exc))
-                                data = None
-                            if isinstance(data, dict):
-                                events.append(data)
-                        lines = []
-                elif line.startswith("data:"):
-                    lines.append(line[5:].lstrip())
+        """增量解析 Codex JSON/SSE，避免整份 base64 响应产生多份内存副本。"""
 
+        max_total_bytes = 64 * 1024 * 1024
+        max_event_bytes = 40 * 1024 * 1024
+        content_type = str(raw.headers.get("content-type") or "").lower()
+        status_code = getattr(raw, "status_code", getattr(raw, "status", None))
+        total_bytes = 0
+        event_count = 0
         event_types: Dict[str, int] = {}
         image_result_lengths: list[int] = []
-        for event in events:
+        parse_errors: list[str] = []
+        event_summaries: list[Dict[str, Any]] = []
+        event_previews: list[str] = []
+        body_preview = bytearray()
+        chunk_iterator = (
+            iter(raw.iter_content(chunk_size=64 * 1024))
+            if hasattr(raw, "iter_content")
+            else None
+        )
+
+        def record(event: Dict[str, Any]) -> None:
+            nonlocal event_count
+            event_count += 1
             event_type = str(event.get("type") or "<missing>")
             event_types[event_type] = event_types.get(event_type, 0) + 1
             image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
-        logger.info({
-            "event": "codex_responses_response_debug",
-            "status_code": status_code,
-            "content_type": content_type,
-            "response_text_len": len(text),
-            "event_count": len(events),
-            "event_types": event_types,
-            "image_result_lengths": image_result_lengths[:10],
-            "parse_error_count": len(parse_errors),
-            "parse_errors": parse_errors[:5],
-            "event_summaries": [OpenAIBackendAPI._codex_event_summary(event) for event in events[:30]],
-            "event_previews": [
-                OpenAIBackendAPI._codex_body_preview(event, 1500)
-                for event in events[:10]
-            ] if not image_result_lengths else [],
-            "body_preview": text[:1000] if not events else "",
-        })
-        for event in events:
-            yield event
+            if len(event_summaries) < 30:
+                event_summaries.append(OpenAIBackendAPI._codex_event_summary(event))
+            if len(event_previews) < 10:
+                event_previews.append(OpenAIBackendAPI._codex_body_preview(event, 1500))
+
+        def read_chunk() -> bytes:
+            nonlocal total_bytes
+            if chunk_iterator is not None:
+                try:
+                    chunk = next(chunk_iterator)
+                except StopIteration:
+                    chunk = b""
+            else:
+                chunk = raw.read(64 * 1024)
+            if not chunk:
+                return b""
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", "replace")
+            total_bytes += len(chunk)
+            if total_bytes > max_total_bytes:
+                raise RuntimeError("Codex upstream response exceeds 64MB limit")
+            if len(body_preview) < 1000:
+                body_preview.extend(chunk[: 1000 - len(body_preview)])
+            return chunk
+
+        try:
+            if "application/json" in content_type:
+                payload = bytearray()
+                while chunk := read_chunk():
+                    payload.extend(chunk)
+                try:
+                    data = json.loads(payload.decode("utf-8", "replace"))
+                except Exception as exc:
+                    parse_errors.append(str(exc)[:300])
+                    data = None
+                if isinstance(data, dict):
+                    record(data)
+                    yield data
+                return
+
+            buffer = bytearray()
+            data_lines: list[bytes] = []
+            data_size = 0
+
+            def parse_data_lines() -> Dict[str, Any] | None:
+                nonlocal data_lines, data_size
+                payload_bytes = b"\n".join(data_lines).strip()
+                data_lines = []
+                data_size = 0
+                if not payload_bytes or payload_bytes == b"[DONE]":
+                    return None
+                try:
+                    data = json.loads(payload_bytes.decode("utf-8", "replace"))
+                except Exception as exc:
+                    if len(parse_errors) < 5:
+                        parse_errors.append(str(exc)[:300])
+                    return None
+                return data if isinstance(data, dict) else None
+
+            while True:
+                chunk = read_chunk()
+                if chunk:
+                    buffer.extend(chunk)
+                elif buffer:
+                    buffer.extend(b"\n\n")
+                elif data_lines:
+                    event = parse_data_lines()
+                    if event is not None:
+                        record(event)
+                        yield event
+                    break
+                else:
+                    break
+
+                while True:
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        break
+                    line = bytes(buffer[:newline]).rstrip(b"\r")
+                    del buffer[: newline + 1]
+                    if not line:
+                        event = parse_data_lines()
+                        if event is not None:
+                            record(event)
+                            yield event
+                    elif line.startswith(b"data:"):
+                        part = line[5:].lstrip()
+                        data_size += len(part)
+                        if data_size > max_event_bytes:
+                            raise RuntimeError("Codex upstream event exceeds 40MB limit")
+                        data_lines.append(part)
+                if len(buffer) > max_event_bytes:
+                    raise RuntimeError("Codex upstream event exceeds 40MB limit")
+                if not chunk:
+                    break
+        finally:
+            logger.info({
+                "event": "codex_responses_response_debug",
+                "status_code": status_code,
+                "content_type": content_type,
+                "response_text_len": total_bytes,
+                "event_count": event_count,
+                "event_types": event_types,
+                "image_result_lengths": image_result_lengths[:10],
+                "parse_error_count": len(parse_errors),
+                "parse_errors": parse_errors[:5],
+                "event_summaries": event_summaries,
+                "event_previews": event_previews if not image_result_lengths else [],
+                "body_preview": body_preview.decode("utf-8", "replace") if not event_count else "",
+            })
 
     def iter_codex_image_response_events(
             self,
@@ -780,22 +905,17 @@ class OpenAIBackendAPI:
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         account = account_service.get_account(self.access_token) or {}
         token_payload = account_service._decode_jwt_payload(self.access_token)
         auth_claim = token_payload.get("https://api.openai.com/auth")
         auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
         tool = payload["tools"][0]
+        timeout_secs = self._image_timeout(1200, "Codex 图片生成")
         logger.info({
             "event": "codex_responses_request_debug",
             "url": self.base_url + path,
-            "transport": "urllib.request",
-            "timeout_secs": 1200,
+            "transport": "curl_cffi_deadline_session",
+            "timeout_secs": round(timeout_secs, 3),
             "account_email": str(account.get("email") or "").strip(),
             "source_type": str(account.get("source_type") or "").strip(),
             "account_type": str(account.get("type") or "").strip(),
@@ -827,20 +947,51 @@ class OpenAIBackendAPI:
                 if key.lower() != "authorization"
             },
         })
+        response = None
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
-                yield from self._iter_codex_response_events(raw)
-        except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
-            try:
-                body = json.loads(body_text)
-            except Exception:
-                pass
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+            # DeadlineSession 为 stream 句柄设置 CURLOPT_TIMEOUT_MS，硬时限覆盖 DNS、
+            # connect、请求体上传、响应头等待和响应体，不再留下 urllib 的滴流漏洞。
+            response = self.session.post(
+                self.base_url + path,
+                headers=self._codex_responses_headers(),
+                json=payload,
+                timeout=timeout_secs,
+                stream=True,
+            )
+            if not 200 <= response.status_code < 300:
+                error_body = bytearray()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    self._check_image_deadline("Codex 错误响应")
+                    if not chunk:
+                        continue
+                    error_body.extend(chunk)
+                    if len(error_body) > 1024 * 1024:
+                        del error_body[1024 * 1024:]
+                        break
+                body_text = error_body.decode("utf-8", "replace")
+                if len(error_body) >= 1024 * 1024:
+                    body_text += "\n…[error body truncated]"
+                body: Any = body_text
+                try:
+                    body = json.loads(body_text)
+                except Exception:
+                    pass
+                self._log_codex_response_failure(path, response.status_code, response.headers, payload, body)
+                retry_after_header = response.headers.get("Retry-After")
+                retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+                raise UpstreamHTTPError(path, response.status_code, body, retry_after=retry_after)
+
+            for event in self._iter_codex_response_events(response):
+                self._check_image_deadline("Codex 图片生成")
+                yield event
+        except ImageTaskRuntimeError:
+            raise
+        except Exception:
+            self._check_image_deadline("Codex 图片生成")
+            raise
+        finally:
+            if response is not None:
+                response.close()
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -874,52 +1025,72 @@ class OpenAIBackendAPI:
         return response.json().get("conduit_token", "")
 
     def _decode_image_base64(self, image: str) -> bytes:
-        """把 base64 图片字符串、本地路径或 HTTP(S) URL 解码成二进制。"""
+        """把 base64 图片字符串或 HTTP(S) URL 解码成二进制。"""
+        max_size = 20 * 1024 * 1024
         # HTTP(S) URL — download the image
         if image.startswith(("http://", "https://")):
             return self._download_image_url(image)
-        # Short non-data-url string — try as local file path
-        if (
-                image
-                and len(image) < 512
-                and not image.startswith("data:")
-                and "\n" not in image
-                and "\r" not in image
-        ):
-            file_path = Path(os.path.expanduser(image))
-            if file_path.exists() and file_path.is_file():
-                return file_path.read_bytes()
         # Base64 (with or without data-url header)
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
-        return base64.b64decode(payload)
+        if len(payload) > ((max_size + 2) // 3) * 4 + 4:
+            raise RuntimeError("input image exceeds 20MB limit")
+        data = base64.b64decode(payload, validate=True)
+        if len(data) > max_size:
+            raise RuntimeError("input image exceeds 20MB limit")
+        return data
 
     def _download_image_url(self, url: str) -> bytes:
         """下载 HTTP(S) 图片 URL，返回二进制内容。"""
         max_size = 20 * 1024 * 1024  # 20 MB
         logger.info({"event": "image_url_download", "url": url})
         try:
-            response = requests.get(
+            download_session = DeadlineSession(image_deadline=getattr(self, "image_deadline", None))
+            response = download_session.get(
                 url,
                 headers={
                     "User-Agent": self.user_agent,
                     "Accept": "image/*,*/*;q=0.8",
                 },
-                timeout=60,
+                timeout=self._image_timeout(60, "输入图片下载"),
                 verify=True,
+                stream=True,
             )
+        except ImageTaskRuntimeError:
+            if "download_session" in locals():
+                download_session.close()
+            raise
         except Exception as exc:
+            if "download_session" in locals():
+                download_session.close()
             raise RuntimeError(f"failed to download image from URL: {url}: {exc}") from exc
         if response.status_code != 200:
+            response.close()
+            download_session.close()
             raise RuntimeError(
                 f"failed to download image from URL (HTTP {response.status_code}): {url}"
             )
-        data = response.content
+        content_length = str(response.headers.get("content-length") or "").strip()
+        if content_length.isdigit() and int(content_length) > max_size:
+            response.close()
+            download_session.close()
+            raise RuntimeError(f"image exceeds maximum size ({max_size // (1024 * 1024)}MB): {url}")
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                self._check_image_deadline("输入图片下载")
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_size:
+                    raise RuntimeError(f"image exceeds maximum size ({max_size // (1024 * 1024)}MB): {url}")
+                chunks.append(chunk)
+        finally:
+            response.close()
+            download_session.close()
+        data = b"".join(chunks)
         if not data:
             raise RuntimeError(f"downloaded image is empty: {url}")
-        if len(data) > max_size:
-            raise RuntimeError(
-                f"image exceeds maximum size ({max_size // (1024 * 1024)}MB): {url}"
-            )
         logger.info({"event": "image_url_downloaded", "url": url, "size": len(data)})
         return data
 
@@ -932,16 +1103,6 @@ class OpenAIBackendAPI:
             url_basename = url_path.rsplit("/", 1)[-1]
             if "." in url_basename:
                 file_name = url_basename
-        elif (
-                image
-                and len(image) < 512
-                and not image.startswith("data:")
-                and "\n" not in image
-                and "\r" not in image
-        ):
-            candidate_path = Path(os.path.expanduser(image))
-            if candidate_path.exists() and candidate_path.is_file():
-                file_name = candidate_path.name
         image = Image.open(BytesIO(data))
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
@@ -1262,14 +1423,23 @@ class OpenAIBackendAPI:
             timeout_secs,
             poll_interval_secs,
         )
-        downloaded = [self._download_editable_artifact(
-            conversation_id,
-            item,
-            output_path,
-            primary_mime_types,
-            primary_mime_keywords,
-            primary_default_extension,
-        ) for item in artifacts]
+        downloaded: list[Path] = []
+        downloaded_total = 0
+        for item in artifacts:
+            remaining = EDITABLE_ARTIFACT_TOTAL_MAX_BYTES - downloaded_total
+            if remaining <= 0:
+                raise RuntimeError("editable artifacts exceed 384MB total limit")
+            path = self._download_editable_artifact(
+                conversation_id,
+                item,
+                output_path,
+                primary_mime_types,
+                primary_mime_keywords,
+                primary_default_extension,
+                max_bytes=min(EDITABLE_ARTIFACT_MAX_BYTES, remaining),
+            )
+            downloaded.append(path)
+            downloaded_total += path.stat().st_size
         primary_path = next((item for item in downloaded if item.suffix.lower() in primary_suffixes), None)
         zip_path = next((item for item in downloaded if item.suffix.lower() == ".zip"), None)
         if not primary_path or not zip_path:
@@ -1602,17 +1772,60 @@ class OpenAIBackendAPI:
             primary_mime_types: set[str],
             primary_mime_keywords: tuple[str, ...],
             primary_default_extension: str,
+            max_bytes: int = EDITABLE_ARTIFACT_MAX_BYTES,
     ) -> Path:
         download_url = self._resolve_editable_download_url(conversation_id, artifact)
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
-        response = self.session.get(download_url, timeout=300)
-        ensure_ok(response, "artifact_download")
-        content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
-        file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
-        target_path = self._unique_editable_path(output_dir / file_name)
-        target_path.write_bytes(response.content)
-        return target_path
+        response = self.session.get(
+            download_url,
+            timeout=self._image_timeout(300, "可编辑文件下载"),
+            stream=True,
+        )
+        temp_path: Path | None = None
+        try:
+            ensure_ok(response, "artifact_download")
+            content_length = str(response.headers.get("Content-Length") or "").strip()
+            if content_length.isdigit() and int(content_length) > max_bytes:
+                raise RuntimeError("editable artifact exceeds download size limit")
+            content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
+            file_name = self._resolve_editable_output_name(
+                artifact,
+                response.url,
+                response.headers.get("Content-Disposition"),
+                content_type,
+                primary_mime_types,
+                primary_mime_keywords,
+                primary_default_extension,
+            )
+            target_path = self._unique_editable_path(output_dir / file_name)
+            temp_path = target_path.with_name(target_path.name + ".part")
+            temp_path.unlink(missing_ok=True)
+            # Content-Length 可用时先按完整文件预检；流式写入时仍逐块复查，
+            # 防止同卷上的其他进程在下载期间消耗剩余空间。
+            expected_bytes = int(content_length) if content_length.isdigit() else 0
+            ensure_disk_space(output_dir, expected_bytes)
+            written = 0
+            with temp_path.open("xb") as output:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    self._check_image_deadline("可编辑文件下载")
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > max_bytes:
+                        raise RuntimeError("editable artifact exceeds download size limit")
+                    guarded_write_chunk(output, output_dir, chunk)
+            if written <= 0:
+                raise RuntimeError("editable artifact download returned empty content")
+            temp_path.replace(target_path)
+            temp_path = None
+            return target_path
+        except InsufficientDiskSpaceError as exc:
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            response.close()
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
         ids: list[str] = []
@@ -2159,7 +2372,7 @@ class OpenAIBackendAPI:
           (capped at 16s, +jitter) honoring Retry-After when present.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
         """
-        start = time.time()
+        start = time.monotonic()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
@@ -2182,17 +2395,29 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            local_remaining = timeout_secs - (time.monotonic() - start)
+            deadline = getattr(self, "image_deadline", None)
+            if deadline is not None:
+                local_remaining = min(local_remaining, deadline.check("图片结果轮询"))
+            return local_remaining
 
         if has_initial_ids and config.image_settle_enabled:
             settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
             if settle_for > 0:
-                time.sleep(settle_for)
+                deadline = getattr(self, "image_deadline", None)
+                if deadline is not None:
+                    deadline.sleep(settle_for, "图片结果二次确认")
+                else:
+                    time.sleep(settle_for)
         elif initial_wait > 0:
             jitter = random.uniform(0, min(2.0, initial_wait * 0.2))
             sleep_for = min(initial_wait + jitter, max(0.0, _remaining()))
             if sleep_for > 0:
-                time.sleep(sleep_for)
+                deadline = getattr(self, "image_deadline", None)
+                if deadline is not None:
+                    deadline.sleep(sleep_for, "图片轮询首次等待")
+                else:
+                    time.sleep(sleep_for)
 
         def _retry_sleep(reason: str, status_code: int | None, error: str | None, retry_after: int | None) -> bool:
             # retry_after=0 means "retry immediately" — must not be coerced via falsy check.
@@ -2214,7 +2439,11 @@ class OpenAIBackendAPI:
             if error is not None:
                 log_payload["error"] = error
             logger.warning(log_payload)
-            time.sleep(sleep_for)
+            deadline = getattr(self, "image_deadline", None)
+            if deadline is not None:
+                deadline.sleep(sleep_for, "图片轮询重试等待")
+            else:
+                time.sleep(sleep_for)
             return True
 
         last_task_error = ""
@@ -2236,6 +2465,8 @@ class OpenAIBackendAPI:
                             "error_msg": error_msg,
                             "metadata": metadata,
                         })
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 # tasks 查询失败不影响正常轮询流程
                 logger.debug({
@@ -2252,6 +2483,8 @@ class OpenAIBackendAPI:
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
                         continue
                     break
+                raise
+            except ImageTaskRuntimeError:
                 raise
             except requests.exceptions.RequestException as exc:
                 if _retry_sleep("network", None, str(exc), None):
@@ -2305,14 +2538,22 @@ class OpenAIBackendAPI:
                              "settle_secs": config.image_settle_secs})
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
                 if wait > 0:
-                    time.sleep(wait)
+                    deadline = getattr(self, "image_deadline", None)
+                    if deadline is not None:
+                        deadline.sleep(wait, "图片结果二次确认")
+                    else:
+                        time.sleep(wait)
                     continue
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
-                          "elapsed_secs": round(time.time() - start, 1)})
+                          "elapsed_secs": round(time.monotonic() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
-                time.sleep(wait)
+                deadline = getattr(self, "image_deadline", None)
+                if deadline is not None:
+                    deadline.sleep(wait, "图片轮询间隔")
+                else:
+                    time.sleep(wait)
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -2437,6 +2678,8 @@ class OpenAIBackendAPI:
                 continue
             try:
                 url = self._get_file_download_url(file_id)
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2468,6 +2711,8 @@ class OpenAIBackendAPI:
         for sediment_id in sediment_ids:
             try:
                 url = self._get_attachment_download_url(conversation_id, sediment_id)
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 logger.debug({
                     "event": "image_download_url_failed",
@@ -2547,6 +2792,8 @@ class OpenAIBackendAPI:
                     "file_ids": file_ids,
                     "sediment_ids": sediment_ids,
                 })
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 if not file_ids and not sediment_ids:
                     raise
@@ -2564,11 +2811,36 @@ class OpenAIBackendAPI:
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
+        max_image_size = 25 * 1024 * 1024
+        max_total_size = 50 * 1024 * 1024
+        total_size = 0
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            response = self.session.get(
+                url,
+                timeout=self._image_timeout(120, "生成图片下载"),
+                stream=True,
+            )
+            try:
+                ensure_ok(response, "image_download")
+                content_length = str(response.headers.get("content-length") or "").strip()
+                if content_length.isdigit() and int(content_length) > max_image_size:
+                    raise RuntimeError("generated image exceeds 25MB limit")
+                chunks: list[bytes] = []
+                image_size = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    self._check_image_deadline("生成图片下载")
+                    if not chunk:
+                        continue
+                    image_size += len(chunk)
+                    total_size += len(chunk)
+                    if image_size > max_image_size or total_size > max_total_size:
+                        raise RuntimeError("generated images exceed size limit")
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                if content and content not in images:
+                    images.append(content)
+            finally:
+                response.close()
         return images
 
     def stream_conversation(
@@ -2599,7 +2871,9 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, path)
         try:
-            yield from iter_sse_payloads(response)
+            for payload in iter_sse_payloads(response):
+                self._check_image_deadline("图片生成流")
+                yield payload
         finally:
             response.close()
 
@@ -2619,8 +2893,17 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        if len(images) > 4:
+            raise RuntimeError("at most 4 input images are supported")
         self._report_progress("uploading")
-        references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
+        references: list[Dict[str, Any]] = []
+        total_input_bytes = 0
+        for idx, image in enumerate(images, start=1):
+            reference = self._upload_image(image, f"image_{idx}.png")
+            total_input_bytes += int(reference.get("file_size") or 0)
+            if total_input_bytes > 50 * 1024 * 1024:
+                raise RuntimeError("input images exceed 50MB total limit")
+            references.append(reference)
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")

@@ -82,22 +82,22 @@ def response_image_tool(body: dict[str, Any]) -> dict[str, object]:
     return {}
 
 
-def extract_response_image(input_value: object) -> tuple[bytes, str] | None:
+def extract_response_image(input_value: object, deadline=None) -> tuple[bytes, str] | None:
     if isinstance(input_value, dict):
         if str(input_value.get("type") or "").strip() == "input_image":
-            images = extract_image_from_message_content([input_value])
+            images = extract_image_from_message_content([input_value], deadline, max_images=1)
             return images[0] if images else None
-        images = extract_image_from_message_content(input_value.get("content"))
+        images = extract_image_from_message_content(input_value.get("content"), deadline, max_images=1)
         return images[0] if images else None
     if not isinstance(input_value, list):
         return None
     for item in reversed(input_value):
         if isinstance(item, dict):
             if str(item.get("type") or "").strip() == "input_image":
-                images = extract_image_from_message_content([item])
+                images = extract_image_from_message_content([item], deadline, max_images=1)
                 if images:
                     return images[0]
-            images = extract_image_from_message_content(item.get("content"))
+            images = extract_image_from_message_content(item.get("content"), deadline, max_images=1)
             if images:
                 return images[0]
     return None
@@ -289,8 +289,13 @@ def response_completed(
 
 
 def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    from services.image_task_runtime import image_deadline_from_payload
+
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(messages_from_input(body.get("input"), body.get("instructions"))))
+    messages = normalize_text_messages(normalize_messages(
+        messages_from_input(body.get("input"), body.get("instructions")),
+        deadline=image_deadline_from_payload(body),
+    ))
     if has_unsupported_response_tools(body):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
@@ -306,7 +311,14 @@ def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str,
     full_text = ""
     yield response_created(response_id, model, created)
     yield {"type": "response.output_item.added", "output_index": 0, "item": text_output_item("", item_id, "in_progress")}
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+    from services.image_task_runtime import image_deadline_from_payload
+
+    request = ConversationRequest(
+        model=model,
+        messages=messages,
+        thinking_effort=thinking_effort,
+        deadline=image_deadline_from_payload(body),
+    )
     for delta in stream_text_deltas(backend, request):
         full_text += delta
         yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
@@ -427,7 +439,10 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "input text is required"})
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
-    image_info = extract_response_image(body.get("input"))
+    from services.image_task_runtime import image_deadline_from_payload
+
+    deadline = image_deadline_from_payload(body)
+    image_info = extract_response_image(body.get("input"), deadline)
     if image_info:
         image_data, mime_type = image_info
         images = encode_images([(image_data, "image.png", mime_type)])
@@ -442,6 +457,7 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         quality=str(tool.get("quality") or "auto"),
         response_format="b64_json",
         images=images,
+        deadline=deadline,
     ))
     yield from stream_image_response(image_outputs, prompt, model, input_image_tokens, tool.get("size"), str(tool.get("quality") or "auto"))
 

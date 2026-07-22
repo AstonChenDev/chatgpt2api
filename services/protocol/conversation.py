@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import re
 import threading
@@ -14,9 +15,11 @@ import tiktoken
 from services.account_service import account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
+from services.image_task_runtime import ImageTaskDeadline, ImageTaskRuntimeError
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    MessageImageBudget,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -24,6 +27,11 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+
+
+MAX_OUTPUT_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_OUTPUT_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_OUTPUT_IMAGE_BASE64_CHARS = ((MAX_OUTPUT_IMAGE_BYTES + 2) // 3) * 4 + 4
 
 
 class ImageGenerationError(Exception):
@@ -148,8 +156,12 @@ def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
 
-def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
-    return image_storage_service.save(image_data, base_url).url
+def save_image_bytes(
+    image_data: bytes,
+    base_url: str | None = None,
+    deadline: ImageTaskDeadline | None = None,
+) -> str:
+    return image_storage_service.save(image_data, base_url, deadline=deadline).url
 
 
 def message_text(content: Any) -> str:
@@ -166,8 +178,15 @@ def message_text(content: Any) -> str:
     return ""
 
 
-def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
+def normalize_messages(
+    messages: object,
+    system: Any = None,
+    deadline: ImageTaskDeadline | None = None,
+) -> list[dict[str, Any]]:
     normalized = []
+    # 同一预算贯穿全部历史消息，避免攻击者把每条消息都塞入 4 张慢 URL，顺序
+    # 下载数十张并长期占用线程、内存。
+    image_budget = MessageImageBudget()
     if config.global_system_prompt:
         normalized.append({"role": "system", "content": config.global_system_prompt})
     system_text = message_text(system)
@@ -182,14 +201,7 @@ def normalize_messages(messages: object, system: Any = None) -> list[dict[str, A
             text = message_text(content)
             images: list[tuple[bytes, str]] = []
             if role == "user":
-                images.extend(extract_image_from_message_content(content))
-                if isinstance(content, list):
-                    for part in content:
-                        if not isinstance(part, dict) or part.get("type") != "image":
-                            continue
-                        data = part.get("data")
-                        if isinstance(data, (bytes, bytearray)) and all(existing[0] != bytes(data) for existing in images):
-                            images.append((bytes(data), str(part.get("mime") or "image/png")))
+                images.extend(extract_image_from_message_content(content, deadline, image_budget))
             if images:
                 parts: list[Any] = []
                 if text:
@@ -269,22 +281,37 @@ def format_image_result(
     base_url: str | None = None,
     created: int | None = None,
     message: str = "",
+    deadline: ImageTaskDeadline | None = None,
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
+    decoded_total = 0
     for item in items:
         b64_json = str(item.get("b64_json") or "").strip()
         if not b64_json:
             continue
+        if len(b64_json) > MAX_OUTPUT_IMAGE_BASE64_CHARS:
+            raise ImageGenerationError("上游返回的单张图片超过 25MB 安全上限")
+        try:
+            image_bytes = base64.b64decode(b64_json, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ImageGenerationError("上游返回了无效的图片数据") from exc
+        if not image_bytes:
+            raise ImageGenerationError("上游返回了空图片数据")
+        if len(image_bytes) > MAX_OUTPUT_IMAGE_BYTES:
+            raise ImageGenerationError("上游返回的单张图片超过 25MB 安全上限")
+        decoded_total += len(image_bytes)
+        if decoded_total > MAX_OUTPUT_IMAGE_TOTAL_BYTES:
+            raise ImageGenerationError("上游返回的图片总量超过 50MB 安全上限")
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         if response_format == "b64_json":
             data.append({
                 "b64_json": b64_json,
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_bytes, base_url, deadline),
                 "revised_prompt": revised_prompt,
             })
         else:
             data.append({
-                "url": save_image_bytes(base64.b64decode(b64_json), base_url),
+                "url": save_image_bytes(image_bytes, base_url, deadline),
                 "revised_prompt": revised_prompt,
             })
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
@@ -307,6 +334,25 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    deadline: ImageTaskDeadline | None = None
+
+
+def _check_image_deadline(request: ConversationRequest, phase: str) -> None:
+    if request.deadline is not None:
+        request.deadline.check(phase)
+
+
+def _image_sleep(request: ConversationRequest, seconds: float, phase: str) -> None:
+    if request.deadline is not None:
+        request.deadline.sleep(seconds, phase)
+    else:
+        time.sleep(seconds)
+
+
+def _image_phase_budget(request: ConversationRequest, desired_secs: float, phase: str) -> float:
+    if request.deadline is None:
+        return float(desired_secs)
+    return min(float(desired_secs), request.deadline.check(phase))
 
 
 @dataclass
@@ -658,8 +704,12 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    deadline: ImageTaskDeadline | None = None,
 ) -> Iterator[dict[str, Any]]:
-    normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
+    normalized = normalize_messages(
+        messages or ([{"role": "user", "content": prompt}] if prompt else []),
+        deadline=deadline,
+    )
     image_model = is_supported_image_model(model)
     history_text = "" if image_model else assistant_history_text(normalized)
     history_messages = [] if image_model else assistant_history_messages(normalized)
@@ -690,13 +740,14 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             attempted_tokens.add(token)
         active_backend = None
         try:
-            active_backend = OpenAIBackendAPI(access_token=token)
+            active_backend = OpenAIBackendAPI(access_token=token, image_deadline=request.deadline)
             for event in conversation_events(
                 active_backend,
                 messages=request.messages,
                 model=request.model,
                 prompt=request.prompt,
                 thinking_effort=request.thinking_effort,
+                deadline=request.deadline,
             ):
                 if event.get("type") != "conversation.delta":
                     continue
@@ -709,7 +760,12 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
+                refreshed_token = account_service.refresh_access_token(
+                    token,
+                    force=True,
+                    event="text_stream",
+                    deadline=request.deadline,
+                )
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
                     token = refreshed_token
                 else:
@@ -751,7 +807,10 @@ def _get_detailed_error_from_tasks(
     import time as _time
     try:
         if wait_secs > 0:
-            _time.sleep(wait_secs)
+            if backend.image_deadline is not None:
+                backend.image_deadline.sleep(wait_secs, "图片错误详情等待")
+            else:
+                _time.sleep(wait_secs)
         tasks = backend._query_backend_tasks(conversation_id=conversation_id, timeout_secs=timeout_secs)
         if not tasks:
             return ""
@@ -767,6 +826,8 @@ def _get_detailed_error_from_tasks(
                 })
                 return error_msg
         return ""
+    except ImageTaskRuntimeError:
+        raise
     except Exception as exc:
         logger.warning({
             "event": "image_task_error_query_failed",
@@ -776,13 +837,31 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
+_IMAGE_CLEANUP_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-conversation-cleanup")
+_IMAGE_CLEANUP_SLOTS = threading.BoundedSemaphore(16)
+
+
 def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id: str) -> None:
     if not config.image_remove_conversation_after_result or not conversation_id:
         return
 
+    if not _IMAGE_CLEANUP_SLOTS.acquire(blocking=False):
+        logger.warning({
+            "event": "image_conversation_remove_skipped",
+            "conversation_id": conversation_id,
+            "reason": "cleanup_queue_full",
+        })
+        return
+
+    access_token = backend.access_token
+
     def _run() -> None:
+        cleanup_backend = None
         try:
-            backend.delete_conversation(conversation_id)
+            # 清理是非关键维护动作，单独使用短截止线和独立客户端，不能拖慢主结果。
+            cleanup_deadline = ImageTaskDeadline(10)
+            cleanup_backend = OpenAIBackendAPI(access_token=access_token, image_deadline=cleanup_deadline)
+            cleanup_backend.delete_conversation(conversation_id)
             logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
         except Exception as exc:
             logger.warning({
@@ -790,8 +869,12 @@ def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id:
                 "conversation_id": conversation_id,
                 "error": str(exc),
             })
+        finally:
+            if cleanup_backend is not None:
+                cleanup_backend.close()
+            _IMAGE_CLEANUP_SLOTS.release()
 
-    threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
+    _IMAGE_CLEANUP_EXECUTOR.submit(_run)
 
 
 def stream_image_outputs(
@@ -800,6 +883,7 @@ def stream_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
+    _check_image_deadline(request, "图片生成")
     last: dict[str, Any] = {}
     for event in conversation_events(
             backend,
@@ -809,6 +893,7 @@ def stream_image_outputs(
             size=request.size,
             quality=request.quality,
     ):
+        _check_image_deadline(request, "上游图片生成流")
         last = event
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
@@ -883,6 +968,8 @@ def stream_image_outputs(
                     "conversation_id": conversation_id,
                     "message_preview": message[:200],
                 })
+        except ImageTaskRuntimeError:
+            raise
         except Exception as exc:
             logger.warning({
                 "event": "image_conversation_id_recovery_failed",
@@ -913,13 +1000,19 @@ def stream_image_outputs(
                 "error": detailed_error,
             })
 
-    # 当检测到文本回复（含 referenced_image_ids）时，使用更长的超时来轮询图片结果。
-    # 因为上游可能将图片生成作为异步任务执行，SSE 流在工具完成前就断开了，
-    # 导致对话文档中尚未写入图片工具的响应记录。
-    poll_timeout = config.image_poll_timeout_secs
+    # 已经拿到 conversation_id 说明上游任务确实创建成功。此时必须在同一任务上
+    # 用完“总截止线”的大部分剩余预算，不能被旧的 120 秒单阶段配置提前截断，更不能
+    # 换账号重复提交。预留约 5%（最少 2 秒、最多 15 秒）用于下载和持久化结果。
+    poll_timeout = _image_phase_budget(request, config.image_poll_timeout_secs, "图片结果轮询")
+    if conversation_id and request.deadline is not None:
+        remaining = request.deadline.check("图片结果轮询")
+        finish_reserve = min(15.0, max(2.0, remaining * 0.05))
+        poll_timeout = max(0.1, remaining - finish_reserve)
+    elif is_text_reply and conversation_id:
+        # 没有新运行时截止线的兼容调用仍保留旧的文本回复扩展轮询行为。
+        poll_timeout = _image_phase_budget(request, max(poll_timeout, 300), "图片结果轮询")
+
     if is_text_reply and conversation_id:
-        # 文本回复场景下图片可能仍在异步生成，使用更长超时（默认 120s → 额外 180s = 300s）
-        poll_timeout = max(poll_timeout, 300)
         logger.info({
             "event": "image_text_reply_extended_poll",
             "conversation_id": conversation_id,
@@ -942,6 +1035,8 @@ def stream_image_outputs(
             image_urls = []
         else:
             raise
+    except ImageTaskRuntimeError:
+        raise
     except Exception as exc:
         # 当检测到文本回复时，首次轮询的临时网络错误不应直接中断，
         # 因为图片可能仍在后台异步生成中，后续 retry poll 会继续尝试。
@@ -968,6 +1063,7 @@ def stream_image_outputs(
             request.response_format,
             request.base_url,
             int(time.time()),
+            deadline=request.deadline,
         )["data"]
         if data:
             _remove_image_conversation_later(backend, conversation_id)
@@ -992,6 +1088,8 @@ def stream_image_outputs(
                         "conversation_id": conversation_id,
                         "message_preview": message[:200],
                     })
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 logger.warning({
                     "event": "image_text_reply_conversation_id_recovery_failed",
@@ -1005,9 +1103,12 @@ def stream_image_outputs(
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
             # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
-            retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+            retry_poll_timeout = _image_phase_budget(
+                request, max(config.image_poll_timeout_secs, 300), "图片结果补充轮询"
+            )
             MAX_POLL_RETRIES = 3
             for poll_attempt in range(1, MAX_POLL_RETRIES + 1):
+                _check_image_deadline(request, "图片结果补充轮询")
                 try:
                     polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                         conversation_id,
@@ -1018,6 +1119,8 @@ def stream_image_outputs(
                     file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                     sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                     break  # 轮询成功，退出重试循环
+                except ImageTaskRuntimeError:
+                    raise
                 except Exception as exc:
                     error_str = str(exc)
                     is_transient = (
@@ -1044,7 +1147,7 @@ def stream_image_outputs(
                             "poll_attempt": poll_attempt,
                             "backoff_secs": backoff,
                         })
-                        time.sleep(backoff)
+                        _image_sleep(request, backoff, "图片轮询退避")
                         continue
                     # 超时错误或重试次数用尽，停止重试
                     break
@@ -1066,6 +1169,7 @@ def stream_image_outputs(
                         request.response_format,
                         request.base_url,
                         int(time.time()),
+                        deadline=request.deadline,
                     )["data"]
                     if data:
                         _remove_image_conversation_later(backend, conversation_id)
@@ -1102,6 +1206,8 @@ def stream_image_outputs(
                     "event": "image_fallback_conversation_id_recovered",
                     "conversation_id": conversation_id,
                 })
+        except ImageTaskRuntimeError:
+            raise
         except Exception as exc:
             logger.warning({
                 "event": "image_fallback_conversation_id_recovery_failed",
@@ -1110,9 +1216,12 @@ def stream_image_outputs(
     if should_poll_for_image and conversation_id:
         # 图片可能仍在异步处理中（上游 SSE 流在图片生成完成前就结束了）。
         # 使用 300s 超时并允许多次重试，避免因临时网络问题或图片尚未提交而提前退出。
-        retry_poll_timeout = max(config.image_poll_timeout_secs, 300)
+        retry_poll_timeout = _image_phase_budget(
+            request, max(config.image_poll_timeout_secs, 300), "图片结果兜底轮询"
+        )
         MAX_FALLBACK_POLL_RETRIES = 3
         for poll_attempt in range(1, MAX_FALLBACK_POLL_RETRIES + 1):
+            _check_image_deadline(request, "图片结果兜底轮询")
             retry_wait_secs = min(30.0 * poll_attempt, config.image_poll_initial_wait_secs * poll_attempt)
             logger.info({
                 "event": "image_stream_retry_poll_after_wait",
@@ -1120,7 +1229,7 @@ def stream_image_outputs(
                 "retry_wait_secs": retry_wait_secs,
                 "poll_attempt": poll_attempt,
             })
-            time.sleep(retry_wait_secs)
+            _image_sleep(request, retry_wait_secs, "图片兜底轮询等待")
             try:
                 polled_file_ids, polled_sediment_ids = backend._poll_image_results(
                     conversation_id,
@@ -1131,6 +1240,8 @@ def stream_image_outputs(
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
                 break  # 轮询成功，退出重试循环
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 error_str = str(exc)
                 is_transient = (
@@ -1157,7 +1268,7 @@ def stream_image_outputs(
                         "poll_attempt": poll_attempt,
                         "backoff_secs": backoff,
                     })
-                    time.sleep(backoff)
+                    _image_sleep(request, backoff, "图片兜底轮询退避")
                     continue
                 # 超时错误或重试次数用尽，停止重试
                 break
@@ -1179,6 +1290,7 @@ def stream_image_outputs(
                     request.response_format,
                     request.base_url,
                     int(time.time()),
+                    deadline=request.deadline,
                 )["data"]
                 if data:
                     _remove_image_conversation_later(backend, conversation_id)
@@ -1226,12 +1338,23 @@ def stream_codex_image_outputs(
         index: int = 1,
         total: int = 1,
 ) -> Iterator[ImageOutput]:
-    images = _codex_response_images(list(backend.iter_codex_image_response_events(
+    # 逐条消费 SSE，只保留最终图片字符串。旧逻辑 list(events) 会把上游完整事件
+    # （可能包含大段中间内容）全部留在内存，多个并发请求足以造成内存尖峰。
+    images: list[str] = []
+    for event in backend.iter_codex_image_response_events(
         prompt=request.prompt,
         images=request.images or [],
         size=request.size,
         quality=request.quality,
-    )))
+    ):
+        _check_image_deadline(request, "Codex 图片生成流")
+        for image in _codex_response_images(event):
+            if len(image) > MAX_OUTPUT_IMAGE_BASE64_CHARS:
+                raise ImageGenerationError("上游返回的单张图片超过 25MB 安全上限")
+            if image not in images:
+                images.append(image)
+            if len(images) > 4:
+                raise ImageGenerationError("上游返回的图片数量超过 4 张安全上限")
     if not images:
         raise ImageGenerationError("No image result found in response")
     data = format_image_result(
@@ -1240,6 +1363,7 @@ def stream_codex_image_outputs(
         request.response_format,
         request.base_url,
         int(time.time()),
+        deadline=request.deadline,
     )["data"]
     if data:
         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data)
@@ -1273,6 +1397,7 @@ def _generate_single_image(
     account_email = ""
 
     while True:
+        _check_image_deadline(request, "图片生成")
         try:
             if request.progress_callback:
                 request.progress_callback("getting_account")
@@ -1282,13 +1407,27 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                deadline=request.deadline,
             )
+        except ImageTaskRuntimeError:
+            raise
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
         emitted_for_token = False
         returned_message = False
         returned_result = False
+        slot_finalized = False
+
+        def finalize_account_slot(success: bool) -> None:
+            """一个账号租约只能结算一次，写库异常也不能误释放其他并发任务。"""
+
+            nonlocal slot_finalized
+            if slot_finalized:
+                return
+            slot_finalized = True
+            account_service.mark_image_result(token, success)
+
         account = account_service.get_account(token) or {}
         account_email = str(account.get("email") or "").strip()
         logger.debug({
@@ -1300,7 +1439,7 @@ def _generate_single_image(
         })
         backend = None
         try:
-            backend = OpenAIBackendAPI(access_token=token)
+            backend = OpenAIBackendAPI(access_token=token, image_deadline=request.deadline)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1322,10 +1461,9 @@ def _generate_single_image(
                 returned_result = returned_result or output.kind == "result"
                 outputs.append(output)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                finalize_account_slot(False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1336,15 +1474,20 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=conv_id,
                     )
+                finalize_account_slot(False)
                 return outputs
-            account_service.mark_image_result(token, True)
+            finalize_account_slot(True)
             return outputs
+        except ImageTaskRuntimeError:
+            finalize_account_slot(False)
+            raise
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            finalize_account_slot(False)
             if account_email:
                 setattr(exc, "account_email", account_email)
             # 轮询超时：换账号重试
-            if not emitted_for_token:
+            # 上游已经创建任务后，超时只能继续轮询原任务，不能换账号重复提交。
+            if not emitted_for_token and not getattr(exc, "conversation_id", ""):
                 poll_timeout_retry_count += 1
                 if poll_timeout_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
                     logger.warning({
@@ -1366,7 +1509,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            finalize_account_slot(False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,
@@ -1383,7 +1526,7 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            finalize_account_slot(False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1425,7 +1568,7 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            finalize_account_slot(False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1435,7 +1578,12 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
+                refreshed_token = account_service.refresh_access_token(
+                    token,
+                    force=True,
+                    event="image_stream",
+                    deadline=request.deadline,
+                )
                 if refreshed_token and refreshed_token != token:
                     token = refreshed_token
                     continue
@@ -1453,7 +1601,7 @@ def _generate_single_image(
                         "index": index,
                         "error": last_error[:200],
                     })
-                    time.sleep(min(2.0 * tls_retry_count, 10.0))
+                    _image_sleep(request, min(2.0 * tls_retry_count, 10.0), "图片 TLS 重试等待")
                     continue
             # 连接超时错误（curl 28）：同账号短等待重试，不切换账号
             if not emitted_for_token and is_connection_timeout_error(last_error):
@@ -1469,7 +1617,7 @@ def _generate_single_image(
                         "wait_secs": wait_secs,
                         "error": last_error[:200],
                     })
-                    time.sleep(wait_secs)
+                    _image_sleep(request, wait_secs, "图片连接重试等待")
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
@@ -1479,6 +1627,7 @@ def _generate_single_image(
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
     """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    _check_image_deadline(request, "图片生成")
     if not is_supported_image_model(request.model):
         raise ImageGenerationError("unsupported image model,supported models: " + ", ".join(sorted(IMAGE_MODELS)))
 
@@ -1558,6 +1707,9 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
                 })
 
     if not emitted:
+        runtime_error = next((error for error in errors.values() if isinstance(error, ImageTaskRuntimeError)), None)
+        if runtime_error is not None:
+            raise runtime_error
         if not last_error:
             last_error = "no account in the pool could generate images — check account quota and rate-limit status"
         raise ImageGenerationError(image_stream_error_message(last_error), conversation_id="")

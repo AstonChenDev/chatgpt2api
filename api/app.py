@@ -9,10 +9,12 @@ from fastapi.responses import FileResponse
 
 from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
+from api.request_body_guard import ImageRequestBodyGuardMiddleware
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+from services.runtime_watchdog import start_runtime_watchdog
 
 
 def create_app() -> FastAPI:
@@ -25,16 +27,20 @@ def create_app() -> FastAPI:
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
         backup_service.start()
         config.cleanup_old_images()
+        watchdog_thread = start_runtime_watchdog(stop_event)
         try:
             yield
         finally:
             stop_event.set()
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
+            if watchdog_thread is not None:
+                watchdog_thread.join(timeout=1)
             backup_service.stop()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
+    app.add_middleware(ImageRequestBodyGuardMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

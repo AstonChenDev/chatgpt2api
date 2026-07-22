@@ -24,6 +24,7 @@ class MessageRequest:
     messages: list[dict[str, Any]]
     model: str
     tools: Any = None
+    deadline: Any = None
 
 
 def _tool_meta(tool: dict[str, object]) -> tuple[str, str, object]:
@@ -108,12 +109,16 @@ def preprocess_payload(payload: dict[str, object], text_mapper: Callable[[str], 
 
 
 def message_request(body: dict[str, Any]) -> MessageRequest:
+    from services.image_task_runtime import image_deadline_from_payload
+
     payload = preprocess_payload(dict(body))
+    deadline = image_deadline_from_payload(body)
     return MessageRequest(
-        backend=OpenAIBackendAPI(access_token=account_service.get_text_access_token()),
-        messages=normalize_messages(payload.get("messages"), payload.get("system")),
+        backend=OpenAIBackendAPI(access_token=account_service.get_text_access_token(), image_deadline=deadline),
+        messages=normalize_messages(payload.get("messages"), payload.get("system"), deadline=deadline),
         model=str(payload.get("model") or "auto").strip() or "auto",
         tools=payload.get("tools"),
+        deadline=deadline,
     )
 
 
@@ -290,13 +295,15 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     request = message_request(body)
     if body.get("stream"):
         return stream_events(
-            stream_text_chat_completion(request.backend, request.messages, request.model),
+            stream_text_chat_completion(request.backend, request.messages, request.model, deadline=request.deadline),
             request.model,
             count_message_tokens(request.messages, request.model),
             lambda text: count_text_tokens(text, request.model),
             request.tools,
         )
-    text = collect_chat_content(stream_text_chat_completion(request.backend, request.messages, request.model))
+    text = collect_chat_content(
+        stream_text_chat_completion(request.backend, request.messages, request.model, deadline=request.deadline)
+    )
     return message_response(
         request.model,
         text,

@@ -5,6 +5,7 @@ from typing import Any, Iterator
 
 from PIL import Image
 
+from services.image_task_runtime import image_deadline_from_payload
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -15,6 +16,8 @@ from services.protocol.conversation import (
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
+
+MAX_EDIT_IMAGE_PIXELS = 25_000_000
 
 
 def _composite_mask(
@@ -32,8 +35,13 @@ def _composite_mask(
     result: list[tuple[bytes, str, str]] = []
     for i, (data, filename, mime_type) in enumerate(images):
         mask_data = masks[i][0] if i < len(masks) else masks[-1][0]
-        img = Image.open(BytesIO(data)).convert("RGBA")
+        source_img = Image.open(BytesIO(data))
+        if source_img.width * source_img.height > MAX_EDIT_IMAGE_PIXELS:
+            raise ImageGenerationError("image dimensions are too large (maximum 25 megapixels)")
+        img = source_img.convert("RGBA")
         mask_img = Image.open(BytesIO(mask_data))
+        if mask_img.width * mask_img.height > MAX_EDIT_IMAGE_PIXELS:
+            raise ImageGenerationError("mask dimensions are too large (maximum 25 megapixels)")
         if mask_img.mode == "RGBA":
             alpha = mask_img.split()[3]
         elif mask_img.mode == "L":
@@ -74,6 +82,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=encoded_images,
         message_as_error=True,
         progress_callback=progress_callback,
+        deadline=image_deadline_from_payload(body),
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

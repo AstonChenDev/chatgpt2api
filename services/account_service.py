@@ -5,6 +5,7 @@ import json
 import secrets
 import time
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,12 +14,34 @@ from typing import Any
 from urllib.parse import urlencode
 
 from services.config import config
+from services.image_task_runtime import (
+    ImageTaskDeadline,
+    ImageTaskQueueTimeoutError,
+    ImageTaskRuntimeError,
+)
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
+
+
+@contextmanager
+def _deadline_lock(lock, deadline: ImageTaskDeadline | None, phase: str):
+    """让图片链路等待共享锁时也服从自己的端到端截止线。"""
+
+    if deadline is None:
+        lock.acquire()
+    else:
+        acquired = lock.acquire(timeout=deadline.check(phase))
+        if not acquired:
+            deadline.check(phase)
+            raise RuntimeError(f"{phase} lock timeout")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class AccountService:
@@ -352,7 +375,12 @@ class AccountService:
         due_at = anchor + timedelta(seconds=self._REFRESH_TOKEN_KEEPALIVE_SECONDS)
         return due_at if due_at <= now else None
 
-    def _request_access_token_refresh(self, refresh_token: str, account: dict | None = None) -> dict[str, str]:
+    def _request_access_token_refresh(
+        self,
+        refresh_token: str,
+        account: dict | None = None,
+        deadline: ImageTaskDeadline | None = None,
+    ) -> dict[str, str]:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
@@ -370,7 +398,7 @@ class AccountService:
                     "refresh_token": refresh_token,
                     "client_id": self._OAUTH_CLIENT_ID,
                 },
-                timeout=60,
+                timeout=deadline.network_timeout(60, "图片账号令牌刷新") if deadline else 60,
             )
             data = response.json() if response.text else {}
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
@@ -434,10 +462,19 @@ class AccountService:
         )
         return new_token
 
-    def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
+    def refresh_access_token(
+        self,
+        access_token: str,
+        *,
+        force: bool = False,
+        event: str = "refresh_access_token",
+        deadline: ImageTaskDeadline | None = None,
+    ) -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        if deadline is not None:
+            deadline.check("图片账号令牌刷新")
+        with _deadline_lock(self._token_refresh_lock, deadline, "等待图片账号令牌刷新锁"):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -450,7 +487,9 @@ class AccountService:
             if not force and self._recent_token_refresh_error(account):
                 return active_token
             try:
-                token_data = self._request_access_token_refresh(refresh_token, account)
+                token_data = self._request_access_token_refresh(refresh_token, account, deadline)
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 error_str = str(exc or "")
                 self._record_token_refresh_error(active_token, event, error_str)
@@ -925,9 +964,16 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: ImageTaskDeadline | None = None,
     ) -> str:
-        with self._image_slot_condition:
+        account_queue_expires = None
+        if deadline is not None:
+            queue_timeout = config.get_image_task_runtime_settings()["queue_timeout_secs"]
+            account_queue_expires = min(deadline.expires_at, time.monotonic() + queue_timeout)
+        with _deadline_lock(self._image_slot_condition, deadline, "等待图片账号调度锁"):
             while True:
+                if deadline is not None:
+                    deadline.check("等待可用图片账号")
                 if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
@@ -939,7 +985,14 @@ class AccountService:
                     self._index += 1
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
-                self._image_slot_condition.wait(timeout=1.0)
+                if account_queue_expires is not None:
+                    account_wait = account_queue_expires - time.monotonic()
+                    if account_wait <= 0:
+                        raise ImageTaskQueueTimeoutError("等待可用图片账号超时，请稍后重试。")
+                    wait_secs = min(1.0, account_wait, deadline.check("等待可用图片账号"))
+                else:
+                    wait_secs = 1.0
+                self._image_slot_condition.wait(timeout=wait_secs)
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:
@@ -958,6 +1011,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: ImageTaskDeadline | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -967,15 +1021,30 @@ class AccountService:
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
         for _attempt in range(max_attempts):
+            if deadline is not None:
+                deadline.check("获取可用图片账号")
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
                 plan_type=plan_type,
                 source_type=source_type,
                 plan_types=plan_types,
+                deadline=deadline,
             )
             attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
+                # deadline 是二开新增的可选参数。普通链路不传这个关键字，既保持
+                # 上游原方法的调用形态，也兼容部署方已有的 monkeypatch/子类覆写。
+                if deadline is None:
+                    account = self.fetch_remote_info(access_token, "get_available_access_token")
+                else:
+                    account = self.fetch_remote_info(
+                        access_token,
+                        "get_available_access_token",
+                        deadline=deadline,
+                    )
+            except ImageTaskRuntimeError:
+                self.release_image_slot(access_token)
+                raise
             except Exception:
                 self.release_image_slot(access_token)
                 continue
@@ -1317,23 +1386,35 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        deadline: ImageTaskDeadline | None = None,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        if deadline is not None:
+            deadline.check("校验图片账号")
+        active_token = self.refresh_access_token(
+            access_token,
+            event=f"{event}:preflight",
+            deadline=deadline,
+        ) or access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
-            backend = OpenAIBackendAPI(active_token)
+            backend = OpenAIBackendAPI(active_token, image_deadline=deadline)
             try:
                 result = backend.get_user_info()
             finally:
                 backend.close()
         except InvalidAccessTokenError as exc:
-            refreshed_token = self.refresh_access_token(active_token, force=True, event=f"{event}:invalid_access_token")
+            refreshed_token = self.refresh_access_token(
+                active_token,
+                force=True,
+                event=f"{event}:invalid_access_token",
+                deadline=deadline,
+            )
             if refreshed_token and refreshed_token != active_token:
                 try:
-                    backend = OpenAIBackendAPI(refreshed_token)
+                    backend = OpenAIBackendAPI(refreshed_token, image_deadline=deadline)
                     try:
                         result = backend.get_user_info()
                     finally:

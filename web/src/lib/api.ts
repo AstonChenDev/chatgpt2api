@@ -19,6 +19,23 @@ export type ImageStorageSettings = {
   cos_bucket?: string;
   cos_path_prefix?: string;
   public_base_url: string;
+  /** 凭据只返回是否已配置，后台接口永不下发真实值。 */
+  has_webdav_password?: boolean;
+  has_cos_secret_id?: boolean;
+  has_cos_secret_key?: boolean;
+  /** 至少一个图片存储字段由部署环境变量接管。 */
+  managed_by_env?: boolean;
+};
+
+export type ImageTaskRuntimeSettings = {
+  /** 单次图片请求从进入队列到返回结果的总时限，单位秒。 */
+  total_timeout_secs: number | string;
+  /** 全局最多同时执行的图片任务数。 */
+  max_concurrency: number | string;
+  /** 并发已满时允许排队的任务数，0 表示不排队。 */
+  max_queue_size: number | string;
+  /** 单个任务允许在队列中等待的最长时间，单位秒。 */
+  queue_timeout_secs: number | string;
 };
 
 export type Account = {
@@ -183,6 +200,7 @@ export type SettingsConfig = {
   auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
+  image_task_runtime?: ImageTaskRuntimeSettings;
   proxy_runtime?: ProxyRuntimeSettings;
   third_party_apps?: ThirdPartyAppsSettings;
   backup?: BackupSettings;

@@ -4,7 +4,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from api.support import require_admin, require_identity, resolve_image_base_url
@@ -22,6 +22,7 @@ from services.image_service import (
     storage_stats,
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
+from services.image_io_runtime import image_io_runtime
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
@@ -90,32 +91,49 @@ def create_router(app_version: str) -> APIRouter:
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            return {"config": config.update(body.model_dump(mode="python"))}
+            return {
+                "config": await image_io_runtime.run(
+                    config.update,
+                    body.model_dump(mode="python"),
+                )
+            }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
+        return await image_io_runtime.run(
+            list_images,
+            resolve_image_base_url(request),
+            start_date=start_date.strip(),
+            end_date=end_date.strip(),
+        )
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
-        return get_image_response(image_path)
+        return await image_io_runtime.run(get_image_response, image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
-        return get_thumbnail_response(image_path)
+        return await image_io_runtime.run(get_thumbnail_response, image_path)
 
     @router.post("/api/images/delete")
     async def delete_images_endpoint(body: ImageDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return delete_images(body.paths, start_date=body.start_date.strip(), end_date=body.end_date.strip(), all_matching=body.all_matching)
+        return await image_io_runtime.run(
+            delete_images,
+            body.paths,
+            start_date=body.start_date.strip(),
+            end_date=body.end_date.strip(),
+            all_matching=body.all_matching,
+            timeout_secs=120,
+        )
 
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        buf = download_images_zip(body.paths)
+        buf = await image_io_runtime.run(download_images_zip, body.paths, timeout_secs=120)
         return StreamingResponse(
             buf,
             media_type="application/zip",
@@ -125,17 +143,24 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images/download/{image_path:path}")
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return get_image_download_response(image_path)
+        return await image_io_runtime.run(get_image_download_response, image_path)
 
     @router.get("/api/logs")
     async def get_logs(type: str = "", start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": log_service.list(type=type.strip(), start_date=start_date.strip(), end_date=end_date.strip())}
+        return {
+            "items": await image_io_runtime.run(
+                log_service.list,
+                type=type.strip(),
+                start_date=start_date.strip(),
+                end_date=end_date.strip(),
+            )
+        }
 
     @router.post("/api/logs/delete")
     async def delete_logs(body: LogDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return log_service.delete(body.ids)
+        return await image_io_runtime.run(log_service.delete, body.ids)
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
@@ -154,7 +179,10 @@ def create_router(app_version: str) -> APIRouter:
     async def save_proxy_runtime_endpoint(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            config.update({"proxy_runtime": body.model_dump(mode="python")})
+            await image_io_runtime.run(
+                config.update,
+                {"proxy_runtime": body.model_dump(mode="python")},
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
         return {
@@ -170,11 +198,14 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        storage = config.get_storage_backend()
-        return {
-            "backend": storage.get_backend_info(),
-            "health": storage.health_check(),
-        }
+        def load_storage_info():
+            storage = config.get_storage_backend()
+            return {
+                "backend": storage.get_backend_info(),
+                "health": storage.health_check(),
+            }
+
+        return await image_io_runtime.run(load_storage_info, timeout_secs=30)
 
     @router.post("/api/backup/test")
     async def test_backup_connection(authorization: str | None = Header(default=None)):
@@ -187,13 +218,13 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/image-storage/test")
     async def test_image_storage_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"result": await run_in_threadpool(image_storage_service.test_connection)}
+        return {"result": await image_io_runtime.run(image_storage_service.test_connection, timeout_secs=60)}
 
     @router.post("/api/image-storage/sync")
     async def sync_image_storage_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         try:
-            return {"result": await run_in_threadpool(image_storage_service.sync_all)}
+            return {"result": await image_io_runtime.run(image_storage_service.sync_all, timeout_secs=300)}
         except ImageStorageError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
@@ -257,7 +288,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/images/tags")
     async def list_image_tags(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"tags": get_all_tags()}
+        return {"tags": await image_io_runtime.run(get_all_tags)}
 
     @router.post("/api/images/tags")
     async def update_image_tags(body: ImageTagsRequest, authorization: str | None = Header(default=None)):
@@ -265,24 +296,24 @@ def create_router(app_version: str) -> APIRouter:
         rel = body.path.strip().lstrip("/")
         if not rel:
             raise HTTPException(status_code=400, detail={"error": "path is required"})
-        tags = set_tags(rel, body.tags)
+        tags = await image_io_runtime.run(set_tags, rel, body.tags)
         return {"ok": True, "tags": tags}
 
     @router.delete("/api/images/tags/{tag}")
     async def delete_image_tag(tag: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        count = delete_tag(tag)
+        count = await image_io_runtime.run(delete_tag, tag)
         return {"ok": True, "removed_from": count}
 
     @router.get("/api/images/storage")
     async def get_image_storage(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return storage_stats()
+        return await image_io_runtime.run(storage_stats)
 
     @router.post("/api/images/storage/compress")
     async def compress_all_images(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return await run_in_threadpool(compress_images)
+        return await image_io_runtime.run(compress_images, timeout_secs=300)
 
     @router.post("/api/images/storage/cleanup-to-target")
     async def cleanup_to_target(
@@ -291,15 +322,37 @@ def create_router(app_version: str) -> APIRouter:
         authorization: str | None = Header(default=None),
     ):
         require_admin(authorization)
-        return await run_in_threadpool(delete_to_target, target_free_mb, dry_run)
+        return await image_io_runtime.run(delete_to_target, target_free_mb, dry_run, timeout_secs=300)
+
+    @router.get("/healthz")
+    async def lightweight_healthcheck():
+        """容器探针只读内存运行状态，不执行外部存储/账号网络请求。"""
+
+        from services.runtime_watchdog import runtime_component_statuses
+
+        components = runtime_component_statuses()
+        healthy = all(bool(status.get("healthy", True)) for status in components.values())
+        payload = {
+            "status": "ok" if healthy else "degraded",
+            "healthy": healthy,
+            "version": app_version,
+            **components,
+        }
+        return JSONResponse(status_code=200 if healthy else 503, content=payload)
 
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
         stats = acct_svc.get_stats()
         storage = config.get_storage_backend()
-        storage_health = storage.health_check()
-        healthy = stats["active"] > 0
+        storage_health = await image_io_runtime.run(storage.health_check, timeout_secs=30)
+        from services.runtime_watchdog import runtime_component_statuses
+
+        runtime_components = runtime_component_statuses()
+        image_runtime = runtime_components["image_runtime"]
+        healthy = stats["active"] > 0 and all(
+            bool(status.get("healthy", True)) for status in runtime_components.values()
+        )
 
         stats_json = {
             "status": "ok" if healthy else "degraded",
@@ -307,6 +360,7 @@ def create_router(app_version: str) -> APIRouter:
             "version": app_version,
             "storage": {"backend": storage.get_backend_info(), "health": storage_health},
             "proxy_runtime": proxy_settings.get_runtime_status(),
+            **runtime_components,
             "accounts": stats,
         }
         if format == "json":
@@ -348,6 +402,7 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 <div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
 <div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
 <div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
+<div class="card"><div class="label">图片任务 运行/排队</div><div class="value blue">{image_runtime['active_jobs']}<span style="font-size:18px;color:#94a3b8">/</span>{image_runtime['queued_jobs']}</div></div>
 <div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
 <div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
 <div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>

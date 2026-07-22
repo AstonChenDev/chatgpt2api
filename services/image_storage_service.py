@@ -16,11 +16,14 @@ from PIL import Image
 from qcloud_cos import CosConfig, CosS3Client
 
 from services.config import DATA_DIR, config
+from services.disk_space_guard import InsufficientDiskSpaceError, atomic_write_bytes
+from services.image_task_runtime import ImageTaskDeadline, ImageTaskRuntimeError
 from utils.log import logger
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+MAX_STORED_IMAGE_BYTES = 25 * 1024 * 1024
 
 
 class ImageStorageError(RuntimeError):
@@ -98,18 +101,22 @@ def _write_json_object(path: Path, data: dict[str, object]) -> None:
 
 
 class WebDAVClient:
-    def __init__(self, settings: dict[str, object]):
+    def __init__(self, settings: dict[str, object], deadline: ImageTaskDeadline | None = None):
         self.url = _clean(settings.get("webdav_url")).rstrip("/")
         self.username = _clean(settings.get("webdav_username"))
         self.password = _clean(settings.get("webdav_password"))
         self.root_path = _clean(settings.get("webdav_root_path")).strip("/")
+        self.deadline = deadline
         self.session = requests.Session()
 
     def _auth_kwargs(self) -> dict[str, object]:
         return {"auth": (self.username, self.password)} if self.username or self.password else {}
 
     def _request(self, method: str, url: str, **kwargs):
-        response = self.session.request(method, url, timeout=30, **self._auth_kwargs(), **kwargs)
+        timeout = self.deadline.network_timeout(30, "WebDAV 图片存储") if self.deadline else 30
+        response = self.session.request(method, url, timeout=timeout, **self._auth_kwargs(), **kwargs)
+        if self.deadline:
+            self.deadline.check("WebDAV 图片存储")
         if response.status_code >= 400 and not (method == "MKCOL" and response.status_code in {405}):
             raise ImageStorageError(f"WebDAV {method} failed: HTTP {response.status_code}")
         return response
@@ -126,7 +133,8 @@ class WebDAVClient:
             if not item:
                 continue
             current = f"{current}/{quote(item, safe='')}"
-            response = self.session.request("MKCOL", current, timeout=30, **self._auth_kwargs())
+            timeout = self.deadline.network_timeout(30, "WebDAV 目录创建") if self.deadline else 30
+            response = self.session.request("MKCOL", current, timeout=timeout, **self._auth_kwargs())
             if response.status_code in {201, 405}:
                 continue
             if response.status_code >= 400:
@@ -139,8 +147,22 @@ class WebDAVClient:
         return url
 
     def get(self, rel: str) -> bytes:
-        response = self._request("GET", self.remote_url(rel))
-        return bytes(response.content)
+        response = self._request("GET", self.remote_url(rel), stream=True)
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if self.deadline:
+                    self.deadline.check("WebDAV 图片读取")
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_STORED_IMAGE_BYTES:
+                    raise ImageStorageError("stored image exceeds 25MB limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            response.close()
 
     def delete(self, rel: str) -> bool:
         response = self.session.request("DELETE", self.remote_url(rel), timeout=30, **self._auth_kwargs())
@@ -167,19 +189,28 @@ class WebDAVClient:
 
 
 class COSClient:
-    def __init__(self, settings: dict[str, object]):
+    def __init__(self, settings: dict[str, object], deadline: ImageTaskDeadline | None = None):
         self.secret_id = _clean(settings.get("cos_secret_id"))
         self.secret_key = _clean(settings.get("cos_secret_key"))
         self.region = _clean(settings.get("cos_region"))
         self.bucket = _clean(settings.get("cos_bucket"))
         self.path_prefix = _clean(settings.get("cos_path_prefix")).strip("/")
+        self.deadline = deadline
         self._client = None
 
     @property
     def client(self) -> CosS3Client:
         if self._client is None:
-            config_cos = CosConfig(Region=self.region, SecretId=self.secret_id, SecretKey=self.secret_key, Timeout=30)
-            self._client = CosS3Client(config_cos)
+            timeout = self.deadline.network_timeout(30, "COS 图片存储") if self.deadline else 30
+            config_cos = CosConfig(
+                Region=self.region,
+                SecretId=self.secret_id,
+                SecretKey=self.secret_key,
+                Timeout=max(1, int(timeout)),
+            )
+            # SDK 默认会额外重试 3 次，每次都可能耗尽初始化时的 timeout，导致
+            # 一次上传突破总截止线数倍。受控图片任务由上层决定回退，因此禁用 SDK 重试。
+            self._client = CosS3Client(config_cos, retry=0 if self.deadline is not None else 3)
         return self._client
 
     def remote_url(self, rel: str) -> str:
@@ -196,6 +227,8 @@ class COSClient:
         prefix = f"{self.path_prefix}/" if self.path_prefix else ""
         key = f"{prefix}{safe_rel}"
         try:
+            if self.deadline:
+                self.deadline.check("COS 图片上传")
             self.client.put_object(
                 Bucket=self.bucket,
                 Body=payload,
@@ -203,6 +236,10 @@ class COSClient:
                 EnableMD5=True,
                 ContentType=content_type
             )
+            if self.deadline:
+                self.deadline.check("COS 图片上传")
+        except ImageTaskRuntimeError:
+            raise
         except Exception as exc:
             raise ImageStorageError(f"COS put_object failed: {exc}")
         return self.remote_url(rel)
@@ -212,12 +249,33 @@ class COSClient:
         prefix = f"{self.path_prefix}/" if self.path_prefix else ""
         key = f"{prefix}{safe_rel}"
         try:
+            if self.deadline:
+                self.deadline.check("COS 图片读取")
             response = self.client.get_object(
                 Bucket=self.bucket,
                 Key=key
             )
             fp = response['Body'].get_raw_stream()
-            return fp.read()
+            chunks: list[bytes] = []
+            total = 0
+            try:
+                while True:
+                    if self.deadline:
+                        self.deadline.check("COS 图片读取")
+                    chunk = fp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_STORED_IMAGE_BYTES:
+                        raise ImageStorageError("stored image exceeds 25MB limit")
+                    chunks.append(chunk)
+                return b"".join(chunks)
+            finally:
+                close = getattr(fp, "close", None)
+                if callable(close):
+                    close()
+        except ImageTaskRuntimeError:
+            raise
         except Exception as exc:
             raise ImageStorageError(f"COS get_object failed: {exc}")
 
@@ -274,6 +332,9 @@ class ImageStorageService:
     def _public_url(self, rel: str, base_url: str | None = None, storage_mode: str | None = None) -> str:
         settings = self.settings()
         mode = storage_mode or _clean(settings.get("mode"))
+        if mode == "local":
+            # 网络存储失败回退本地后，不能继续返回 COS/CDN 域名下不存在的链接。
+            return f"{(base_url or config.base_url).rstrip('/')}/images/{_safe_relative_path(rel)}"
         if mode == "cos":
             return COSClient(settings).remote_url(rel)
         public_base_url = _clean(settings.get("public_base_url"))
@@ -287,8 +348,19 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
-    def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+    def save(
+        self,
+        image_data: bytes,
+        base_url: str | None = None,
+        *,
+        deadline: ImageTaskDeadline | None = None,
+    ) -> StoredImage:
+        # 在线请求不执行全目录清理，避免文件数量增长后把清理耗时算进客户端请求；
+        # 后台清理调度器仍会按原逻辑执行。
+        if deadline is None:
+            config.cleanup_old_images()
+        else:
+            deadline.check("图片结果保存")
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both", "cos"}:
@@ -299,34 +371,69 @@ class ImageStorageService:
         remote_url = ""
 
         if mode in {"local", "both"}:
+            if deadline:
+                deadline.check("本地图片保存")
             path = _local_image_path(rel)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(image_data)
+            try:
+                atomic_write_bytes(path, image_data)
+            except InsufficientDiskSpaceError as exc:
+                raise ImageStorageError(str(exc)) from exc
             stored_local = True
 
         if mode in {"webdav", "both"}:
+            webdav = None
             try:
-                remote_url = WebDAVClient(self.settings()).put(rel, image_data)
+                # deadline=None 时保持旧构造方式，兼容已有扩展/测试中的单参数客户端。
+                webdav = (
+                    WebDAVClient(self.settings(), deadline=deadline)
+                    if deadline is not None
+                    else WebDAVClient(self.settings())
+                )
+                remote_url = webdav.put(rel, image_data)
                 stored_webdav = True
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 if mode == "both":
                     logger.warning(f"WebDAV upload failed: {exc}")
                 else:
                     logger.warning(f"WebDAV upload failed, fallback to local storage: {exc}")
+                    if deadline:
+                        deadline.check("WebDAV 失败后本地保存")
                     path = _local_image_path(rel)
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(image_data)
+                    try:
+                        atomic_write_bytes(path, image_data)
+                    except InsufficientDiskSpaceError as disk_exc:
+                        raise ImageStorageError(str(disk_exc)) from disk_exc
                     stored_local = True
+            finally:
+                session = getattr(webdav, "session", None)
+                if session is not None:
+                    session.close()
 
         if mode == "cos":
             try:
-                remote_url = COSClient(self.settings()).put(rel, image_data)
+                cos = (
+                    COSClient(self.settings(), deadline=deadline)
+                    if deadline is not None
+                    else COSClient(self.settings())
+                )
+                remote_url = cos.put(rel, image_data)
                 stored_cos = True
+            except ImageTaskRuntimeError:
+                raise
             except Exception as exc:
                 logger.warning(f"COS upload failed, fallback to local storage: {exc}")
+                if deadline:
+                    deadline.check("COS 失败后本地保存")
                 path = _local_image_path(rel)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(image_data)
+                try:
+                    atomic_write_bytes(path, image_data)
+                except InsufficientDiskSpaceError as disk_exc:
+                    raise ImageStorageError(str(disk_exc)) from disk_exc
                 stored_local = True
 
         dimensions = _image_dimensions(image_data)
@@ -345,24 +452,58 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
-        with self._index_lock:
+        if deadline is not None:
+            acquired = self._index_lock.acquire(timeout=deadline.network_timeout(10, "图片索引写入"))
+            if not acquired:
+                deadline.check("图片索引写入")
+                raise ImageStorageError("image index lock timeout")
+        else:
+            self._index_lock.acquire()
+        try:
             items = self._load_clean_index()
             items[rel] = item
             self._save_index(items)
+        finally:
+            self._index_lock.release()
+        if deadline:
+            deadline.check("图片结果保存")
         return StoredImage(rel=rel, url=self._public_url(rel, base_url, storage_mode=str(item["storage"])), storage=str(item["storage"]), size=len(image_data))
 
-    def get_bytes(self, rel: str) -> bytes:
+    def get_bytes(self, rel: str, deadline: ImageTaskDeadline | None = None) -> bytes:
         safe_rel = _safe_relative_path(rel)
         if not _is_image_rel(safe_rel):
             raise HTTPException(status_code=404, detail="image not found")
         path = _local_image_path(safe_rel)
         if path.is_file():
-            return path.read_bytes()
+            if deadline:
+                deadline.check("本地图片读取")
+            payload = path.read_bytes()
+            if len(payload) > MAX_STORED_IMAGE_BYTES:
+                raise ImageStorageError("stored image exceeds 25MB limit")
+            if deadline:
+                deadline.check("本地图片读取")
+            return payload
         item = self._load_clean_index().get(safe_rel, {})
         if item.get("webdav"):
-            return WebDAVClient(self.settings()).get(safe_rel)
+            client = (
+                WebDAVClient(self.settings(), deadline=deadline)
+                if deadline is not None
+                else WebDAVClient(self.settings())
+            )
+            try:
+                return client.get(safe_rel)
+            finally:
+                session = getattr(client, "session", None)
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
         if item.get("cos"):
-            return COSClient(self.settings()).get(safe_rel)
+            client = (
+                COSClient(self.settings(), deadline=deadline)
+                if deadline is not None
+                else COSClient(self.settings())
+            )
+            return client.get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
 
     def exists(self, rel: str) -> bool:

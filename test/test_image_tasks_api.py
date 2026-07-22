@@ -41,6 +41,10 @@ class FakeImageTaskService:
             "updated_at": "2026-01-01 00:00:00",
         }
 
+    def submit_edit_with_loader(self, identity, **kwargs):
+        images, masks = kwargs.pop("input_loader")(kwargs["deadline"])
+        return self.submit_edit(identity, images=images, masks=masks, **kwargs)
+
     def list_tasks(self, _identity, ids):
         return {
             "items": [
@@ -116,7 +120,26 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
-        self.assertEqual(images, [(PNG_BYTES, "image_url.png", "image/png")])
+        self.assertEqual(images, [(PNG_BYTES, "image_1.png", "image/png")])
+
+    def test_missing_client_task_id_still_closes_uploaded_files(self):
+        """参数校验失败也必须进入统一 finally，不能泄漏 multipart 临时文件。"""
+
+        with mock.patch.object(
+            image_tasks_module,
+            "close_image_sources",
+            wraps=image_tasks_module.close_image_sources,
+        ) as close_sources:
+            response = self.client.post(
+                "/api/image-tasks/edits",
+                headers=AUTH_HEADERS,
+                data={"prompt": "edit", "model": "gpt-image-2"},
+                files=[("image", ("one.png", b"one", "image/png"))],
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        close_sources.assert_called_once()
+        self.assertEqual(len(close_sources.call_args.args[0]), 1)
 
     def test_list_tasks_reports_missing_ids(self):
         response = self.client.get("/api/image-tasks?ids=task-1,missing", headers=AUTH_HEADERS)

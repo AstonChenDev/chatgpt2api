@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import errno
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 import time
 
 from services.storage.base import StorageBackend
+from services.image_task_runtime_config import (
+    image_task_runtime_settings_with_env,
+    normalize_image_task_runtime_settings,
+)
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+RUNTIME_CONFIG_FILE_NAME = "runtime_config.json"
+_CONFIG_WRITE_LOCK = threading.RLock()
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -51,6 +59,13 @@ IMAGE_STORAGE_ENV_VARS = {
     "cos_bucket": "CHATGPT2API_COS_BUCKET",
     "cos_path_prefix": "CHATGPT2API_COS_PATH_PREFIX",
     "public_base_url": "CHATGPT2API_IMAGE_PUBLIC_BASE_URL",
+}
+
+# 这些字段属于凭据，设置接口只能返回“是否已配置”，绝不能返回真实值。
+IMAGE_STORAGE_SECRET_FIELDS = {
+    "webdav_password",
+    "cos_secret_id",
+    "cos_secret_key",
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -185,17 +200,59 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
 
 
 def _image_storage_settings_with_env(value: object) -> dict[str, object]:
-    """Return image storage settings with non-empty environment overrides.
+    """合并图片存储设置；非空环境变量优先，空变量继续使用持久化配置。"""
 
-    Keeping blank values as "not configured" lets docker-compose.local.yml
-    declare all supported variables without disabling config.json fallback.
-    """
     source = dict(value) if isinstance(value, dict) else {}
     for key, env_name in IMAGE_STORAGE_ENV_VARS.items():
         env_value = os.getenv(env_name)
         if env_value is not None and env_value.strip():
             source[key] = env_value
     return _normalize_image_storage_settings(source)
+
+
+def _image_storage_environment_overrides() -> set[str]:
+    """返回明确由环境变量接管的字段名，不包含任何变量值。"""
+
+    return {
+        key
+        for key, env_name in IMAGE_STORAGE_ENV_VARS.items()
+        if (os.getenv(env_name) or "").strip()
+    }
+
+
+def _public_image_storage_settings(value: object) -> dict[str, object]:
+    """生成后台可见配置；凭据只暴露存在标记，不返回明文。"""
+
+    effective = _image_storage_settings_with_env(value)
+    public = dict(effective)
+    for key in IMAGE_STORAGE_SECRET_FIELDS:
+        public[key] = ""
+        public[f"has_{key}"] = bool(str(effective.get(key) or "").strip())
+    public["managed_by_env"] = bool(_image_storage_environment_overrides())
+    return public
+
+
+def _merge_image_storage_update(current: object, incoming: object) -> dict[str, object]:
+    """合并后台更新，同时保留空凭据并忽略环境变量接管的字段。"""
+
+    merged = dict(current) if isinstance(current, dict) else {}
+    updates = dict(incoming) if isinstance(incoming, dict) else {}
+    environment_overrides = _image_storage_environment_overrides()
+    # 已由环境变量提供的凭据不应在持久化文件里保留副本。
+    for key in IMAGE_STORAGE_SECRET_FIELDS & environment_overrides:
+        merged.pop(key, None)
+    for key, value in updates.items():
+        # `has_*` 和 `managed_by_env` 仅用于后台展示，绝不持久化。
+        if key == "managed_by_env" or key.startswith("has_"):
+            continue
+        # 环境变量的值不能经由后台请求被复制进 config.json。
+        if key in environment_overrides:
+            continue
+        # 凭据输入框留空表示保持原值，避免保存其他设置时误清空密钥。
+        if key in IMAGE_STORAGE_SECRET_FIELDS and not str(value or "").strip():
+            continue
+        merged[key] = value
+    return _normalize_image_storage_settings(merged)
 
 
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
@@ -374,6 +431,33 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
+def _write_json_object(path: Path, data: dict[str, object]) -> None:
+    """以同目录原子替换方式写入 JSON，避免进程中断留下半个配置文件。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with _CONFIG_WRITE_LOCK:
+        try:
+            temporary_path.write_text(payload, encoding="utf-8")
+            # 配置可能包含凭据，默认仅允许文件所有者读取。
+            temporary_path.chmod(0o600)
+            try:
+                temporary_path.replace(path)
+            except OSError as exc:
+                if exc.errno not in {errno.EBUSY, errno.EXDEV}:
+                    raise
+                # Docker 将 config.json 作为单文件 bind mount 时不能替换挂载点；
+                # 退回原位覆盖并 fsync。data 目录内的动态配置仍使用原子替换。
+                with path.open("w", encoding="utf-8") as target:
+                    target.write(payload)
+                    target.flush()
+                    os.fsync(target.fileno())
+                path.chmod(0o600)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     raw_config = _read_json_object(CONFIG_FILE, name="config.json")
@@ -396,10 +480,13 @@ def _load_settings() -> LoadedSettings:
 
 
 class ConfigStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, runtime_config_path: Path | None = None):
         self.path = path
+        # 动态图片运行参数放在 data 中，避免发布时 git reset 覆盖后台设置。
+        self.runtime_config_path = runtime_config_path or path.parent / "data" / RUNTIME_CONFIG_FILE_NAME
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
+        self.runtime_data = _read_json_object(self.runtime_config_path, name=RUNTIME_CONFIG_FILE_NAME)
         self._storage_backend: StorageBackend | None = None
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -413,9 +500,6 @@ class ConfigStore:
 
     def _load(self) -> dict[str, object]:
         return _read_json_object(self.path, name="config.json")
-
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     @property
     def auth_key(self) -> str:
@@ -438,6 +522,18 @@ class ConfigStore:
             return max(1, int(self.data.get("image_retention_days", 30)))
         except (TypeError, ValueError):
             return 30
+
+    @property
+    def image_min_free_mb(self) -> int:
+        """图片与可编辑文件写盘后必须保留的空间，默认 500 MB。"""
+
+        value = os.getenv("CHATGPT2API_IMAGE_MIN_FREE_MB")
+        if value is None or not value.strip():
+            value = self.data.get("image_min_free_mb", 500)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 500
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -598,6 +694,7 @@ class ConfigStore:
         data = dict(self.data)
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
+        data["image_min_free_mb"] = self.image_min_free_mb
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
@@ -612,7 +709,8 @@ class ConfigStore:
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
         data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
+        data["image_storage"] = self.get_public_image_storage_settings()
+        data["image_task_runtime"] = self.get_image_task_runtime_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
@@ -641,31 +739,80 @@ class ConfigStore:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        next_data = dict(self.data)
-        next_data.update(dict(data or {}))
-        if "backup" in next_data:
-            next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-        if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
-            _validate_image_storage_settings(next_data["image_storage"])
-        if "chat_completion_cache" in next_data:
-            next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
-                next_data.get("chat_completion_cache")
-            )
-        if "third_party_apps" in next_data:
-            next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
-        if "proxy_runtime" in next_data:
-            incoming_runtime = next_data.get("proxy_runtime")
-            if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
-                if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
-                    incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
-                    incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
-            next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
-        next_data.pop("backup_state", None)
-        self.data = next_data
-        self._save()
+        incoming_data = dict(data or {})
+        incoming_auth_key = incoming_data.pop("auth-key", None)
+        runtime_update_marker = object()
+        incoming_runtime = incoming_data.pop("image_task_runtime", runtime_update_marker)
+
+        with _CONFIG_WRITE_LOCK:
+            next_data = dict(self.data)
+            next_data.update(incoming_data)
+
+            # 后台 GET 从不返回认证密钥；空值表示保留。若环境变量已接管，
+            # 即使旧客户端主动提交，也不能把环境变量密钥复制回 config.json。
+            auth_managed_by_env = bool((os.getenv("CHATGPT2API_AUTH_KEY") or "").strip())
+            auth_removed_from_file = auth_managed_by_env and "auth-key" in next_data
+            if auth_managed_by_env:
+                next_data.pop("auth-key", None)
+            elif str(incoming_auth_key or "").strip():
+                next_data["auth-key"] = str(incoming_auth_key).strip()
+
+            if "backup" in next_data:
+                next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
+            if "image_storage" in incoming_data:
+                persisted_storage = _merge_image_storage_update(
+                    self.data.get("image_storage"),
+                    incoming_data.get("image_storage"),
+                )
+                # 校验最终有效配置，但只持久化不含环境变量值的部分。
+                _validate_image_storage_settings(_image_storage_settings_with_env(persisted_storage))
+                next_data["image_storage"] = persisted_storage
+            elif "image_storage" in next_data:
+                next_data["image_storage"] = _merge_image_storage_update(
+                    next_data.get("image_storage"),
+                    {},
+                )
+
+            next_runtime_data = dict(self.runtime_data)
+            runtime_changed = incoming_runtime is not runtime_update_marker
+            if runtime_changed:
+                # 后台允许只提交一个字段；其余字段从 data 中的动态配置继承。
+                previous_runtime = self.runtime_data.get("image_task_runtime")
+                if not isinstance(previous_runtime, dict):
+                    # 兼容旧版本：首次保存前仍可读取 config.json 中的旧配置块。
+                    previous_runtime = self.data.get("image_task_runtime")
+                previous_runtime = dict(previous_runtime) if isinstance(previous_runtime, dict) else {}
+                if isinstance(incoming_runtime, dict):
+                    previous_runtime.update(incoming_runtime)
+                next_runtime_data["image_task_runtime"] = normalize_image_task_runtime_settings(previous_runtime)
+
+            if "chat_completion_cache" in next_data:
+                next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
+                    next_data.get("chat_completion_cache")
+                )
+            if "third_party_apps" in next_data:
+                next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+            if "proxy_runtime" in next_data:
+                incoming_proxy_runtime = next_data.get("proxy_runtime")
+                if isinstance(incoming_proxy_runtime, dict):
+                    previous_clearance = self.get_proxy_runtime_settings().get("clearance")
+                    if isinstance(previous_clearance, dict):
+                        incoming_proxy_runtime = dict(incoming_proxy_runtime)
+                        incoming_proxy_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
+                        incoming_proxy_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
+                next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_proxy_runtime)
+            next_data.pop("backup_state", None)
+
+            # 动态运行参数只写入 data/runtime_config.json，避免发布覆盖。
+            legacy_runtime_removed = next_data.pop("image_task_runtime", None) is not None
+            if runtime_changed:
+                _write_json_object(self.runtime_config_path, next_runtime_data)
+            if incoming_data or legacy_runtime_removed or auth_removed_from_file or (
+                not auth_managed_by_env and str(incoming_auth_key or "").strip()
+            ):
+                _write_json_object(self.path, next_data)
+            self.data = next_data
+            self.runtime_data = next_runtime_data
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
@@ -673,6 +820,16 @@ class ConfigStore:
 
     def get_image_storage_settings(self) -> dict[str, object]:
         return _image_storage_settings_with_env(self.data.get("image_storage"))
+
+    def get_public_image_storage_settings(self) -> dict[str, object]:
+        return _public_image_storage_settings(self.data.get("image_storage"))
+
+    def get_image_task_runtime_settings(self) -> dict[str, int]:
+        persisted = self.runtime_data.get("image_task_runtime")
+        if not isinstance(persisted, dict):
+            # 读取旧配置作为一次性兼容回退；下次后台保存会迁移到 data 文件。
+            persisted = self.data.get("image_task_runtime")
+        return image_task_runtime_settings_with_env(persisted)
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))

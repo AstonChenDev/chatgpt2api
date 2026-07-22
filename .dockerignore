@@ -10,5 +10,12 @@ __pycache__
 web/.next
 web/node_modules
 
+# 生产凭据和持久化数据绝不能进入构建上下文。
+.env
+.env.*
+!.env.example
+config.json
+data
+
 assets
 README.md

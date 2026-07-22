@@ -147,7 +147,7 @@ def _resolve_fail_open(review: dict) -> bool:
     return bool(value)
 
 
-def check_request(text: str) -> None:
+def check_request(text: str, deadline=None) -> None:
     text = str(text or "")
     if not text.strip():
         return
@@ -189,15 +189,28 @@ def check_request(text: str) -> None:
                 detail={"error": "AI 审核服务暂时不可用，请稍后重试"},
             )
 
+    session = None
     try:
-        response = requests.post(
-            f"{base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0},
-            timeout=60,
+        request_kwargs = {
+            "headers": {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            "json": {"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0},
+            "timeout": deadline.network_timeout(60, "图片内容审核") if deadline is not None else 60,
             **proxy_settings.build_session_kwargs(),
-        )
+        }
+        if deadline is None:
+            # 普通文本链路保留原调用形态，兼容现有扩展和测试替身。
+            response = requests.post(f"{base_url}/v1/chat/completions", **request_kwargs)
+        else:
+            from services.deadline_http import DeadlineSession
+
+            session = DeadlineSession(image_deadline=deadline)
+            response = session.post(f"{base_url}/v1/chat/completions", **request_kwargs)
+            deadline.check("图片内容审核")
     except Exception as exc:
+        from services.image_task_runtime import ImageTaskRuntimeError
+
+        if isinstance(exc, ImageTaskRuntimeError):
+            raise
         _on_failure({
             "event": "ai_review_request_failed",
             "error": str(exc),
@@ -206,6 +219,9 @@ def check_request(text: str) -> None:
             "original_text_len": len(text),
         })
         return
+    finally:
+        if session is not None:
+            session.close()
 
     try:
         data = response.json()

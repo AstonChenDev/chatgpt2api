@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Iterator
 
+from fastapi import HTTPException
+
+from services.image_task_runtime import image_deadline_from_payload
 from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
@@ -21,7 +26,10 @@ def _decode_images(raw: Any) -> list[str]:
     if not raw:
         return []
     items = raw if isinstance(raw, list) else [raw]
+    if len(items) > 4:
+        raise HTTPException(status_code=400, detail={"error": "一次请求最多支持 4 张输入图片"})
     result = []
+    total_decoded_bytes = 0
     for item in items:
         value = str(item or "").strip()
         if not value:
@@ -29,6 +37,19 @@ def _decode_images(raw: Any) -> list[str]:
         # strip data-url header if present
         if value.startswith("data:") and "," in value:
             value = value.split(",", 1)[1]
+        if not value.startswith(("http://", "https://")):
+            # 先按编码长度估算，避免对异常超大字符串先分配完整解码缓冲区。
+            if len(value) > ((20 * 1024 * 1024 + 2) // 3) * 4 + 4:
+                raise HTTPException(status_code=400, detail={"error": "单张输入图片不能超过 20MB"})
+            try:
+                decoded = base64.b64decode(value, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(status_code=400, detail={"error": "输入图片不是有效的 base64"}) from exc
+            if len(decoded) > 20 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail={"error": "单张输入图片不能超过 20MB"})
+            total_decoded_bytes += len(decoded)
+            if total_decoded_bytes > 50 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail={"error": "输入图片总大小不能超过 50MB"})
         result.append(value)
     return result
 
@@ -54,6 +75,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         images=images or None,
         message_as_error=True,
         progress_callback=progress_callback,
+        # 由 API 入口创建的同一截止线贯穿排队、生成、下载与存储。
+        deadline=image_deadline_from_payload(body),
     ))
     if body.get("stream"):
         return stream_image_chunks(outputs)

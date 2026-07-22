@@ -25,6 +25,7 @@ import {
   type CPARemoteFile,
   type ImageStorageMode,
   type ImageStorageSettings,
+  type ImageTaskRuntimeSettings,
   type ProxyRuntimeClearanceMode,
   type ProxyRuntimeEgressMode,
   type ProxyRuntimeSettings,
@@ -65,6 +66,31 @@ const DEFAULT_THIRD_PARTY_APPS: ThirdPartyAppsSettings = {
     url: "https://canvas.best",
   },
 };
+
+const DEFAULT_IMAGE_TASK_RUNTIME = {
+  total_timeout_secs: 300,
+  max_concurrency: 8,
+  max_queue_size: 16,
+  queue_timeout_secs: 5,
+} satisfies ImageTaskRuntimeSettings;
+
+function normalizeBoundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "string" && value.trim() === "" ? Number.NaN : Number(value);
+  const integer = Number.isFinite(parsed) ? Math.trunc(parsed) : fallback;
+  return Math.min(max, Math.max(min, integer));
+}
+
+function normalizeImageTaskRuntime(value: unknown): ImageTaskRuntimeSettings {
+  const source = typeof value === "object" && value !== null
+    ? value as Partial<ImageTaskRuntimeSettings>
+    : {};
+  return {
+    total_timeout_secs: normalizeBoundedInteger(source.total_timeout_secs, DEFAULT_IMAGE_TASK_RUNTIME.total_timeout_secs, 30, 1800),
+    max_concurrency: normalizeBoundedInteger(source.max_concurrency, DEFAULT_IMAGE_TASK_RUNTIME.max_concurrency, 1, 32),
+    max_queue_size: normalizeBoundedInteger(source.max_queue_size, DEFAULT_IMAGE_TASK_RUNTIME.max_queue_size, 0, 256),
+    queue_timeout_secs: normalizeBoundedInteger(source.queue_timeout_secs, DEFAULT_IMAGE_TASK_RUNTIME.queue_timeout_secs, 0, 60),
+  };
+}
 
 function normalizeProxyRuntime(value: unknown): ProxyRuntimeSettings {
   const source = typeof value === "object" && value !== null ? value as Partial<ProxyRuntimeSettings> : {};
@@ -122,7 +148,7 @@ function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
 }
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
-  const imageStorage = typeof config.image_storage === "object" && config.image_storage
+  const imageStorage: ImageStorageSettings = typeof config.image_storage === "object" && config.image_storage
     ? config.image_storage as ImageStorageSettings
     : {
       enabled: false,
@@ -209,7 +235,12 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
       cos_bucket: String(imageStorage.cos_bucket || ""),
       cos_path_prefix: String(imageStorage.cos_path_prefix || "generated/"),
       public_base_url: String(imageStorage.public_base_url || ""),
+      has_webdav_password: Boolean(imageStorage.has_webdav_password),
+      has_cos_secret_id: Boolean(imageStorage.has_cos_secret_id),
+      has_cos_secret_key: Boolean(imageStorage.has_cos_secret_key),
+      managed_by_env: Boolean(imageStorage.managed_by_env),
     },
+    image_task_runtime: normalizeImageTaskRuntime(config.image_task_runtime),
     proxy_runtime: normalizeProxyRuntime(config.proxy_runtime),
     third_party_apps: normalizeThirdPartyApps(config.third_party_apps),
     backup: {
@@ -316,6 +347,7 @@ type SettingsStore = {
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
   setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
+  setImageTaskRuntimeField: <K extends keyof ImageTaskRuntimeSettings>(key: K, value: ImageTaskRuntimeSettings[K]) => void;
   setProxyRuntimeField: <K extends keyof ProxyRuntimeSettings>(key: K, value: ProxyRuntimeSettings[K]) => void;
   setProxyRuntimeClearanceField: <K extends keyof ProxyRuntimeSettings["clearance"]>(key: K, value: ProxyRuntimeSettings["clearance"][K]) => void;
   setProxyRuntimeStatusCodesText: (value: string) => void;
@@ -459,6 +491,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           cos_path_prefix: String(config.image_storage?.cos_path_prefix || "generated/").trim(),
           public_base_url: String(config.image_storage?.public_base_url || "").trim(),
         },
+        image_task_runtime: normalizeImageTaskRuntime(config.image_task_runtime),
         proxy_runtime: {
           ...normalizeProxyRuntime(config.proxy_runtime),
           proxy_url: String(config.proxy_runtime?.proxy_url || "").trim(),
@@ -555,6 +588,23 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageTimeoutRetrySecs: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_timeout_retry_secs: value } } : {});
+  },
+
+  setImageTaskRuntimeField: (key, value) => {
+    set((state) => {
+      if (!state.config) {
+        return {};
+      }
+      return {
+        config: {
+          ...state.config,
+          image_task_runtime: {
+            ...normalizeImageTaskRuntime(state.config.image_task_runtime),
+            [key]: value,
+          },
+        },
+      };
+    });
   },
 
   setAutoRemoveInvalidAccounts: (value) => {

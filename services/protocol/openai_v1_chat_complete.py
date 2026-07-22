@@ -123,11 +123,17 @@ def stream_text_chat_completion(
     messages: list[dict[str, Any]],
     model: str,
     thinking_effort: str = "",
+    deadline=None,
 ) -> Iterator[dict[str, Any]]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     sent_role = False
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+    request = ConversationRequest(
+        model=model,
+        messages=messages,
+        thinking_effort=thinking_effort,
+        deadline=deadline,
+    )
     for delta_text in stream_text_deltas(backend, request):
         if not sent_role:
             sent_role = True
@@ -162,20 +168,31 @@ def chat_messages_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[bytes, str, str]]]:
+    from services.image_task_runtime import image_deadline_from_payload
+
     model = str(body.get("model") or "gpt-image-2").strip() or "gpt-image-2"
     prompt = extract_chat_prompt(body)
     if not prompt:
         raise HTTPException(status_code=400, detail={"error": "prompt is required"})
+    extracted_images = extract_chat_image(body, image_deadline_from_payload(body))
+    if len(extracted_images) > 4:
+        raise HTTPException(status_code=400, detail={"error": "一次请求最多支持 4 张输入图片"})
+    if sum(len(data) for data, _ in extracted_images) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail={"error": "输入图片总大小不能超过 50MB"})
     images = [
         (data, f"image_{idx}.png", mime)
-        for idx, (data, mime) in enumerate(extract_chat_image(body), start=1)
+        for idx, (data, mime) in enumerate(extracted_images, start=1)
     ]
     return model, prompt, parse_image_count(body.get("n")), images
 
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    from services.image_task_runtime import image_deadline_from_payload
+
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
+    messages = normalize_text_messages(
+        normalize_messages(chat_messages_from_body(body), deadline=image_deadline_from_payload(body))
+    )
     if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
@@ -230,6 +247,8 @@ def image_result_content(result: dict[str, Any]) -> str:
 
 
 def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
+    from services.image_task_runtime import image_deadline_from_payload
+
     model, prompt, n, images = chat_image_args(body)
     result = collect_image_outputs(stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
@@ -237,6 +256,7 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
+        deadline=image_deadline_from_payload(body),
     )))
     response = completion_response(model, image_result_content(result), int(result.get("created") or 0) or None)
     usage = image_usage(
@@ -249,6 +269,8 @@ def image_chat_response(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    from services.image_task_runtime import image_deadline_from_payload
+
     model, prompt, n, images = chat_image_args(body)
     image_outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
@@ -256,6 +278,7 @@ def image_chat_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
         n=n,
         response_format="b64_json",
         images=encode_images(images) or None,
+        deadline=image_deadline_from_payload(body),
     ))
     yield from stream_image_chat_completion(image_outputs, model)
 
@@ -294,10 +317,13 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         thinking_effort = thinking_effort_from_body(body)
+        from services.image_task_runtime import image_deadline_from_payload
+
+        deadline = image_deadline_from_payload(body)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort),
+            lambda: stream_text_chat_completion(text_backend(), messages, model, thinking_effort, deadline),
         )
     if is_image_chat_request(body):
         return image_chat_response(body)
@@ -305,12 +331,20 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
+    from services.image_task_runtime import image_deadline_from_payload
+
+    deadline = image_deadline_from_payload(body)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
         lambda: completion_response(
             model,
-            collect_text(text_backend(), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
+            collect_text(text_backend(), ConversationRequest(
+                model=model,
+                messages=messages,
+                thinking_effort=thinking_effort,
+                deadline=deadline,
+            )),
             messages=messages,
         ),
     )

@@ -214,7 +214,7 @@ export function ConfigCard() {
               placeholder="30"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，超时后点击"继续等待"额外等待的时间。</p>
+            <p className="text-xs text-stone-500">单位秒，超时后点击“继续等待”额外等待的时间。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片二次确认等待时间</label>
@@ -319,6 +319,11 @@ export function ConfigCard() {
             <p className="text-xs leading-6 text-stone-500">
               启用后，新生成的图片将自动同步至第三方存储服务以获得更好的加载体验（如使用腾讯云 CDN 加速）。
             </p>
+            {config?.image_storage?.managed_by_env && (
+              <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-6 text-amber-800">
+                部分图片存储字段由 Docker/.env 接管，环境变量始终优先。后台不会显示或回写其中的凭据；密钥输入框留空会保持现有配置。
+              </p>
+            )}
             <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2 text-xs text-stone-600">
               当前待保存模式：
               <span className="ml-1 font-medium text-stone-900">
@@ -383,6 +388,7 @@ export function ConfigCard() {
                     type="password"
                     value={String(config?.image_storage?.webdav_password || "")}
                     onChange={(event) => setImageStorageField("webdav_password", event.target.value)}
+                    placeholder={config?.image_storage?.has_webdav_password ? "已配置；留空保持不变" : "WebDAV 密码"}
                     className="h-10 rounded-xl border-stone-200 bg-white"
                   />
                 </div>
@@ -406,9 +412,10 @@ export function ConfigCard() {
                 <div className="space-y-2">
                   <label className="text-sm text-stone-700">COS Secret ID</label>
                   <Input
+                    type="password"
                     value={String(config?.image_storage?.cos_secret_id || "")}
                     onChange={(event) => setImageStorageField("cos_secret_id", event.target.value)}
-                    placeholder="AKID..."
+                    placeholder={config?.image_storage?.has_cos_secret_id ? "已配置；留空保持不变" : "AKID..."}
                     className="h-10 rounded-xl border-stone-200 bg-white"
                   />
                 </div>
@@ -418,7 +425,7 @@ export function ConfigCard() {
                     type="password"
                     value={String(config?.image_storage?.cos_secret_key || "")}
                     onChange={(event) => setImageStorageField("cos_secret_key", event.target.value)}
-                    placeholder="Secret Key"
+                    placeholder={config?.image_storage?.has_cos_secret_key ? "已配置；留空保持不变" : "Secret Key"}
                     className="h-10 rounded-xl border-stone-200 bg-white"
                   />
                 </div>
