@@ -18,9 +18,11 @@ from utils.log import logger
 if TYPE_CHECKING:
     from services.image_task_runtime import ImageTaskDeadline
 
-BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+GPT_IMAGE_25_MODELS = {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+CODEX_IMAGE_MODELS = {CODEX_IMAGE_MODEL} | GPT_IMAGE_25_MODELS
+BASE_IMAGE_MODELS = {"gpt-image-2"} | CODEX_IMAGE_MODELS
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
@@ -156,7 +158,14 @@ def is_supported_image_model(model: object) -> bool:
 
 def is_codex_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
-    return base_model == CODEX_IMAGE_MODEL
+    return base_model in CODEX_IMAGE_MODELS
+
+
+def codex_image_tool_model(model: object) -> str:
+    """返回 Codex Responses 图片工具实际使用的模型名。"""
+
+    _, base_model = split_image_model(model)
+    return base_model if base_model in GPT_IMAGE_25_MODELS else "gpt-image-2"
 
 
 def is_image_chat_request(body: dict[str, object]) -> bool:

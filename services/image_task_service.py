@@ -124,6 +124,23 @@ class ImageTaskService:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._tasks = self._load_locked()
+            if not self._is_standby_slot():
+                changed = self._recover_unfinished_locked()
+                changed = self._cleanup_locked() or changed
+                if changed:
+                    self._save_locked()
+
+    @staticmethod
+    def _is_standby_slot() -> bool:
+        from services.deployment_runtime import deployment_runtime
+
+        return deployment_runtime.managed and not deployment_runtime.is_active()
+
+    def activate_from_shared_state(self) -> None:
+        """候选槽切流前从磁盘重载终态任务；调用方必须先排空旧槽。"""
+
+        with self._lock:
+            self._tasks = self._load_locked()
             changed = self._recover_unfinished_locked()
             changed = self._cleanup_locked() or changed
             if changed:

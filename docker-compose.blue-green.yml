@@ -1,0 +1,92 @@
+name: ${COMPOSE_PROJECT_NAME:-chatgpt2api}
+
+x-app-environment: &app-environment
+  STORAGE_BACKEND: sqlite
+  DATABASE_URL: sqlite:////app/data/accounts.db
+  CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+  CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+  CHATGPT2API_IMAGE_STORAGE_ENABLED: ${CHATGPT2API_IMAGE_STORAGE_ENABLED:-}
+  CHATGPT2API_IMAGE_STORAGE_MODE: ${CHATGPT2API_IMAGE_STORAGE_MODE:-}
+  CHATGPT2API_COS_SECRET_ID: ${CHATGPT2API_COS_SECRET_ID:-}
+  CHATGPT2API_COS_SECRET_KEY: ${CHATGPT2API_COS_SECRET_KEY:-}
+  CHATGPT2API_COS_REGION: ${CHATGPT2API_COS_REGION:-}
+  CHATGPT2API_COS_BUCKET: ${CHATGPT2API_COS_BUCKET:-}
+  CHATGPT2API_COS_PATH_PREFIX: ${CHATGPT2API_COS_PATH_PREFIX:-}
+  CHATGPT2API_IMAGE_PUBLIC_BASE_URL: ${CHATGPT2API_IMAGE_PUBLIC_BASE_URL:-}
+  CHATGPT2API_IMAGE_TASK_TOTAL_TIMEOUT_SECS: ${CHATGPT2API_IMAGE_TASK_TOTAL_TIMEOUT_SECS:-}
+  CHATGPT2API_IMAGE_TASK_MAX_CONCURRENCY: ${CHATGPT2API_IMAGE_TASK_MAX_CONCURRENCY:-}
+  CHATGPT2API_IMAGE_TASK_MAX_QUEUE_SIZE: ${CHATGPT2API_IMAGE_TASK_MAX_QUEUE_SIZE:-}
+  CHATGPT2API_IMAGE_TASK_QUEUE_TIMEOUT_SECS: ${CHATGPT2API_IMAGE_TASK_QUEUE_TIMEOUT_SECS:-}
+  CHATGPT2API_IMAGE_MIN_FREE_MB: ${CHATGPT2API_IMAGE_MIN_FREE_MB:-}
+  CHATGPT2API_WATCHDOG_ENABLED: ${CHATGPT2API_WATCHDOG_ENABLED:-true}
+  CHATGPT2API_WATCHDOG_GRACE_SECS: ${CHATGPT2API_WATCHDOG_GRACE_SECS:-60}
+
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: chatgpt2api:local
+  init: true
+  restart: unless-stopped
+  expose:
+    - "80"
+  volumes:
+    - ./data:/app/data
+    - ./config.json:/app/config.json
+  mem_limit: ${CHATGPT2API_CONTAINER_MEMORY_LIMIT:-2g}
+  pids_limit: ${CHATGPT2API_CONTAINER_PIDS_LIMIT:-256}
+  # 正常发布会先确认连接为零再停止；异常停机仍给 5 分钟内的生成任务留出退出时间。
+  stop_grace_period: 330s
+  healthcheck:
+    test: ["CMD", "uv", "run", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/healthz', timeout=3).read()"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  labels:
+    com.chatgpt2api.release: ${CHATGPT2API_RELEASE_SHA:-unknown}
+
+services:
+  app-blue:
+    <<: *app-common
+    container_name: ${CHATGPT2API_CONTAINER_PREFIX:-chatgpt2api}-blue
+    environment:
+      <<: *app-environment
+      CHATGPT2API_DEPLOY_SLOT: blue
+
+  app-green:
+    <<: *app-common
+    container_name: ${CHATGPT2API_CONTAINER_PREFIX:-chatgpt2api}-green
+    environment:
+      <<: *app-environment
+      CHATGPT2API_DEPLOY_SLOT: green
+
+  gateway:
+    image: ${CHATGPT2API_GATEWAY_IMAGE:-docker.m.daocloud.io/library/nginx:1.27-alpine}
+    container_name: ${CHATGPT2API_CONTAINER_PREFIX:-chatgpt2api}-gateway
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${CHATGPT2API_HOST_PORT:-3000}:80"
+    volumes:
+      # 整目录挂载保证 active.conf 原子替换后，nginx reload 能读取新 inode。
+      - ./deploy/nginx:/etc/nginx/conf.d:ro
+    mem_limit: ${CHATGPT2API_GATEWAY_MEMORY_LIMIT:-128m}
+    pids_limit: ${CHATGPT2API_GATEWAY_PIDS_LIMIT:-64}
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

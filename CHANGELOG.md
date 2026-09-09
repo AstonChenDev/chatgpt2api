@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 支持通过 Codex 图片链路调用 `gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst`。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。

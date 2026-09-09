@@ -1391,6 +1391,7 @@ def stream_codex_image_outputs(
         images=request.images or [],
         size=request.size,
         quality=request.quality,
+        model=request.model,
     ):
         _check_image_deadline(request, "Codex 图片生成流")
         for image in _codex_response_images(event):

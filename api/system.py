@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from api.support import require_admin, require_identity, resolve_image_base_url
 from services.backup_service import BackupError, backup_service
 from services.config import config
+from services.image_io_runtime import image_io_runtime
 from services.image_service import (
     compress_images,
     delete_images,
@@ -22,7 +23,6 @@ from services.image_service import (
     storage_stats,
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
-from services.image_io_runtime import image_io_runtime
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
 from services.log_service import log_service
 from services.proxy_service import proxy_settings, test_clearance, test_proxy
@@ -328,9 +328,11 @@ def create_router(app_version: str) -> APIRouter:
     async def lightweight_healthcheck():
         """容器探针只读内存运行状态，不执行外部存储/账号网络请求。"""
 
+        from services.deployment_runtime import deployment_runtime
         from services.runtime_watchdog import runtime_component_statuses
 
         components = runtime_component_statuses()
+        components["deployment"] = deployment_runtime.status()
         healthy = all(bool(status.get("healthy", True)) for status in components.values())
         payload = {
             "status": "ok" if healthy else "degraded",

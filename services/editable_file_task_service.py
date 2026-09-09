@@ -223,16 +223,20 @@ class EditableFileTaskService:
         self._output_cleanup_enabled = bool(enable_output_cleanup)
         self._next_output_cleanup_at = time.monotonic() + EDITABLE_OUTPUT_CLEANUP_INTERVAL_SECS
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        standby = self._is_standby_slot()
+        self._standby = standby
         with self._lock:
             self._tasks = self._load_locked()
-            changed, interrupted_outputs = self._recover_unfinished_locked()
-            changed = self._cleanup_locked() or changed
-            if changed:
-                self._save_locked()
+            interrupted_outputs: list[Path] = []
+            if not standby:
+                changed, interrupted_outputs = self._recover_unfinished_locked()
+                changed = self._cleanup_locked() or changed
+                if changed:
+                    self._save_locked()
         # 文件树扫描和递归删除必须在任务锁外进行，避免健康检查、提交和轮询被磁盘拖住。
         for output_dir in interrupted_outputs:
             self._cleanup_output_directory_with_log(output_dir, "editable_file_recovery_cleanup_error")
-        if self._output_cleanup_enabled:
+        if self._output_cleanup_enabled and not standby:
             self._run_expired_output_cleanup_safely()
         self._watchdog = threading.Thread(
             target=self._watchdog_loop,
@@ -240,6 +244,35 @@ class EditableFileTaskService:
             daemon=True,
         )
         self._watchdog.start()
+
+    @staticmethod
+    def _is_standby_slot() -> bool:
+        from services.deployment_runtime import deployment_runtime
+
+        return deployment_runtime.managed and not deployment_runtime.is_active()
+
+    def activate_from_shared_state(self) -> None:
+        """候选槽切流前重载共享任务；发布脚本会先阻止新任务并排空旧槽。"""
+
+        with self._lock:
+            if self._jobs or self._reservations or self._pending_keys:
+                raise RuntimeError("候选槽存在本地任务，不能激活")
+            self._tasks = self._load_locked()
+            changed, interrupted_outputs = self._recover_unfinished_locked()
+            changed = self._cleanup_locked() or changed
+            if changed:
+                self._save_locked()
+            self._standby = False
+        for output_dir in interrupted_outputs:
+            self._cleanup_output_directory_with_log(output_dir, "editable_file_recovery_cleanup_error")
+        if self._output_cleanup_enabled:
+            self._run_expired_output_cleanup_safely()
+
+    def enter_standby(self) -> None:
+        """旧槽排空时停止周期性清理，避免候选槽激活阶段发生共享写入。"""
+
+        with self._lock:
+            self._standby = True
 
     def submit_ppt(
         self,
@@ -876,7 +909,7 @@ class EditableFileTaskService:
                 wait_for = 0.1
             self._watchdog_wake.wait(wait_for)
             self._watchdog_wake.clear()
-            if self._output_cleanup_enabled and time.monotonic() >= self._next_output_cleanup_at:
+            if self._output_cleanup_enabled and not self._standby and time.monotonic() >= self._next_output_cleanup_at:
                 self._next_output_cleanup_at = time.monotonic() + EDITABLE_OUTPUT_CLEANUP_INTERVAL_SECS
                 self._run_expired_output_cleanup_safely()
 

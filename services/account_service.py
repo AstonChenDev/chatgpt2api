@@ -151,6 +151,15 @@ class AccountService:
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
 
+    def reload_from_storage(self) -> None:
+        """候选槽激活前重载共享账号快照，避免使用启动时的旧内存数据。"""
+
+        with self._lock:
+            self._accounts = self._load_accounts()
+            self._index = 0 if not self._accounts else self._index % len(self._accounts)
+            self._image_inflight.clear()
+            self._token_aliases.clear()
+
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):

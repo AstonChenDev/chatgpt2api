@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
-from threading import Event
+from dataclasses import dataclass
+from threading import Event, Thread
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +15,115 @@ from api.request_body_guard import ImageRequestBodyGuardMiddleware
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.backup_service import backup_service
 from services.config import config
+from services.deployment_runtime import DeploymentGateMiddleware, deployment_runtime
 from services.image_service import start_image_cleanup_scheduler
 from services.runtime_watchdog import start_runtime_watchdog
+
+
+@dataclass
+class _BackgroundWorkers:
+    stop_event: Event
+    threads: list[Thread]
+
+    def request_stop(self) -> None:
+        if deployment_runtime.managed:
+            from services.editable_file_task_service import editable_file_task_service
+
+            editable_file_task_service.enter_standby()
+        self.stop_event.set()
+        backup_service.stop()
+
+    def alive(self) -> bool:
+        return any(thread.is_alive() for thread in self.threads)
+
+    def join(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in self.threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+
+def _start_background_workers(*, reload_shared_state: bool) -> _BackgroundWorkers:
+    if reload_shared_state:
+        # 旧槽已经进入排空状态后才会执行，保证候选槽拿到最新共享状态。
+        from services.account_service import account_service
+        from services.editable_file_task_service import editable_file_task_service
+        from services.image_task_service import image_task_service
+
+        account_service.reload_from_storage()
+        image_task_service.activate_from_shared_state()
+        editable_file_task_service.activate_from_shared_state()
+
+    stop_event = Event()
+    threads = [
+        start_limited_account_watcher(stop_event),
+        start_image_cleanup_scheduler(stop_event),
+    ]
+    backup_service.start()
+    config.cleanup_old_images()
+    watchdog_thread = start_runtime_watchdog(stop_event)
+    if watchdog_thread is not None:
+        threads.append(watchdog_thread)
+    return _BackgroundWorkers(stop_event=stop_event, threads=threads)
+
+
+def _deployment_supervisor(shutdown_event: Event) -> None:
+    """保证只有 active 且非排空槽运行会写共享状态的后台服务。"""
+
+    workers: _BackgroundWorkers | None = None
+    deployment_runtime.mark_transition(
+        ready=False,
+        background_running=False,
+        background_quiesced=True,
+    )
+    while not shutdown_event.is_set():
+        should_run = (
+            deployment_runtime.is_active() and not deployment_runtime.is_draining()
+        )
+        if should_run and workers is None:
+            deployment_runtime.mark_transition(
+                ready=False,
+                background_running=False,
+                background_quiesced=True,
+            )
+            try:
+                workers = _start_background_workers(reload_shared_state=True)
+            except Exception as exc:  # noqa: BLE001 - 激活失败必须留在待机槽并暴露状态
+                deployment_runtime.mark_transition(
+                    ready=False,
+                    background_running=False,
+                    background_quiesced=True,
+                    error=f"{exc.__class__.__name__}: {exc}",
+                )
+            else:
+                deployment_runtime.mark_transition(
+                    ready=True,
+                    background_running=True,
+                    background_quiesced=False,
+                )
+        elif not should_run and workers is not None:
+            deployment_runtime.mark_transition(
+                ready=False,
+                background_running=False,
+                background_quiesced=False,
+            )
+            workers.request_stop()
+            if not workers.alive():
+                workers = None
+                deployment_runtime.mark_transition(
+                    ready=False,
+                    background_running=False,
+                    background_quiesced=True,
+                )
+        shutdown_event.wait(0.25)
+
+    if workers is not None:
+        workers.request_stop()
+        workers.join(timeout=5)
+    deployment_runtime.mark_transition(
+        ready=False,
+        background_running=False,
+        background_quiesced=True,
+    )
 
 
 def create_app() -> FastAPI:
@@ -22,25 +131,32 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        stop_event = Event()
-        thread = start_limited_account_watcher(stop_event)
-        cleanup_thread = start_image_cleanup_scheduler(stop_event)
-        backup_service.start()
-        config.cleanup_old_images()
-        watchdog_thread = start_runtime_watchdog(stop_event)
-        try:
-            yield
-        finally:
-            stop_event.set()
-            thread.join(timeout=1)
-            cleanup_thread.join(timeout=1)
-            if watchdog_thread is not None:
-                watchdog_thread.join(timeout=1)
-            backup_service.stop()
+        if deployment_runtime.managed:
+            shutdown_event = Event()
+            supervisor = Thread(
+                target=_deployment_supervisor,
+                args=(shutdown_event,),
+                name="deployment-slot-supervisor",
+                daemon=True,
+            )
+            supervisor.start()
+            try:
+                yield
+            finally:
+                shutdown_event.set()
+                supervisor.join(timeout=7)
+        else:
+            workers = _start_background_workers(reload_shared_state=False)
+            try:
+                yield
+            finally:
+                workers.request_stop()
+                workers.join(timeout=5)
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
     app.add_middleware(ImageRequestBodyGuardMiddleware)
+    app.add_middleware(DeploymentGateMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

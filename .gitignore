@@ -33,3 +33,7 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+
+# 蓝绿发布的当前流量槽位由服务器运行时生成，不能跟随 Git 发布。
+deploy/nginx/active.conf
+deploy/nginx/.active.*
