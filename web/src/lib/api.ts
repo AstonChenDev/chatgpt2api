@@ -177,6 +177,8 @@ export type SettingsConfig = {
   proxy: string;
   base_url?: string;
   global_system_prompt?: string;
+  default_upstream_model_name?: string;
+  default_thinking_effort?: "auto" | "standard" | "extended" | "max";
   sensitive_words?: string[];
   ai_review?: {
     enabled?: boolean;
@@ -193,6 +195,7 @@ export type SettingsConfig = {
   image_settle_enabled?: boolean;
   image_check_before_hit_enabled?: boolean;
   image_remove_conversation_after_result?: boolean;
+  image_remove_conversation_always?: boolean;
   image_settle_secs?: number | string;
   image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;

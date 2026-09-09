@@ -95,23 +95,43 @@ class DatabaseStorageBackend(StorageBackend):
     ) -> None:
         session = self.Session()
         try:
-            session.query(model).delete()
+            key_column = target_key or source_key
+            existing_rows = {
+                str(getattr(row, key_column)): row
+                for row in session.query(model).all()
+            }
+            incoming_keys: set[str] = set()
+
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 key_value = str(item.get(source_key) or "").strip()
                 if not key_value:
                     continue
-                session.add(
-                    model(
-                        **{target_key or source_key: key_value},
-                        data=json.dumps(item, ensure_ascii=False),
+                if key_value in incoming_keys:
+                    raise ValueError(f"Duplicate {source_key} in storage snapshot")
+
+                incoming_keys.add(key_value)
+                serialized_data = json.dumps(item, ensure_ascii=False)
+                existing_row = existing_rows.get(key_value)
+                if existing_row is None:
+                    session.add(
+                        model(
+                            **{key_column: key_value},
+                            data=serialized_data,
+                        )
                     )
-                )
+                elif existing_row.data != serialized_data:
+                    existing_row.data = serialized_data
+
+            for key_value, row in existing_rows.items():
+                if key_value not in incoming_keys:
+                    session.delete(row)
+
             session.commit()
-        except Exception as e:
+        except Exception:
             session.rollback()
-            raise e
+            raise
         finally:
             session.close()
 

@@ -113,10 +113,14 @@ def message_request(body: dict[str, Any]) -> MessageRequest:
 
     payload = preprocess_payload(dict(body))
     deadline = image_deadline_from_payload(body)
+    model = str(payload.get("model") or "auto").strip() or "auto"
     return MessageRequest(
-        backend=OpenAIBackendAPI(access_token=account_service.get_text_access_token(), image_deadline=deadline),
+        backend=OpenAIBackendAPI(
+            access_token=account_service.get_text_access_token(model=model),
+            image_deadline=deadline,
+        ),
         messages=normalize_messages(payload.get("messages"), payload.get("system"), deadline=deadline),
-        model=str(payload.get("model") or "auto").strip() or "auto",
+        model=model,
         tools=payload.get("tools"),
         deadline=deadline,
     )

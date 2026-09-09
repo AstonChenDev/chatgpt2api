@@ -17,7 +17,7 @@ class ModelListTests(unittest.TestCase):
     def test_list_models_only_returns_image_models_backed_by_account_types(self):
         with (
             mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
+                openai_v1_models.model_catalog_service,
                 "list_models",
                 return_value={"object": "list", "data": []},
             ),
@@ -43,7 +43,7 @@ class ModelListTests(unittest.TestCase):
     def test_list_models_does_not_return_codex_models_for_web_plus_accounts(self):
         with (
             mock.patch.object(
-                openai_v1_models.OpenAIBackendAPI,
+                openai_v1_models.model_catalog_service,
                 "list_models",
                 return_value={"object": "list", "data": []},
             ),
