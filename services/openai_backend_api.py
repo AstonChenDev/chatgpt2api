@@ -649,11 +649,17 @@ class OpenAIBackendAPI:
         if source_type != "codex":
             raise RuntimeError("codex responses endpoint requires a codex source account")
 
-    @staticmethod
-    def _codex_image_input(prompt: str, images: list[str]) -> list[Dict[str, Any]]:
+    def _codex_image_input(self, prompt: str, images: list[str]) -> list[Dict[str, Any]]:
         content: list[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
         for image in images:
-            payload = image if image.startswith("data:image/") else f"data:image/png;base64,{image}"
+            # Codex Responses 只接受图片内容的 data URL，不接受远程 URL。
+            # generations 兼容接口允许调用方传 HTTP(S) 地址，因此必须先下载并
+            # 根据实际图片格式重新编码；此前把 URL 文本直接拼到 base64 字段会被
+            # 上游拒绝为 invalid base64，导致 ai-novel 的垫图请求全部失败。
+            image_bytes = self._decode_image_base64(image)
+            with Image.open(BytesIO(image_bytes)) as decoded:
+                mime_type = Image.MIME.get(decoded.format or "", "image/png")
+            payload = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
             content.append({"type": "input_image", "image_url": payload})
         return [{"role": "user", "content": content}]
 
