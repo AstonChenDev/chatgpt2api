@@ -337,8 +337,8 @@ if [[ "$bootstrap" != true ]]; then
   echo "旧槽进入排空状态：不再接收新生成任务，已进入的请求继续完成。"
 fi
 if [[ "$legacy_migration" == true ]]; then
-  wait_old_slot_quiesced "$LEGACY_CONTAINER" false
-  # 首次迁移的旧镜像不认识蓝绿状态，只能先优雅停止；此后发布均为无损切流。
+  # 首次迁移的旧镜像不认识排空标记。直接发送 SIGTERM 才能先关闭监听、
+  # 阻止新请求继续进入；docker stop 会在超时内等待 Uvicorn 完成存量请求。
   docker stop -t "$DRAIN_TIMEOUT_SECS" "$LEGACY_CONTAINER" >/dev/null
 elif [[ "$bootstrap" != true ]]; then
   old_container="$(slot_container "$active_slot")"
