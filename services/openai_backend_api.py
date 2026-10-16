@@ -73,7 +73,9 @@ DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
-CODEX_RESPONSES_MODEL = "gpt-5.5"
+# gpt-5.5 已于 2026-10-14 从 ChatGPT 登录的 Codex 退役；使用已验证支持
+# Sunburst / Flare 带参考图编辑的基础模型，绘图模型仍由 tools[].model 独立选择。
+CODEX_RESPONSES_MODEL = "gpt-5.6-sol"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
