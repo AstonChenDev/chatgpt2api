@@ -6,6 +6,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/nginx_upstream.sh"
 
 COMPOSE_FILE="${CHATGPT2API_BLUE_GREEN_COMPOSE_FILE:-docker-compose.blue-green.yml}"
 CONTAINER_PREFIX="${CHATGPT2API_CONTAINER_PREFIX:-chatgpt2api}"
@@ -225,12 +226,6 @@ validate_network_path() {
     wget -q -T 5 -O /dev/null "http://${service}:80/healthz"
 }
 
-write_candidate_config() {
-  local slot="$1"
-  local destination="$2"
-  printf 'upstream chatgpt2api_active {\n    server app-%s:80;\n    keepalive 32;\n}\n' "$slot" > "$destination"
-}
-
 validate_nginx_candidate() {
   local candidate="$1"
   local network="$2"
@@ -362,7 +357,9 @@ fi
 traffic_switched=true
 
 wait_healthy "$GATEWAY_CONTAINER"
-curl -fsS --max-time 10 "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null
+# graceful reload 与 Docker DNS 初次解析存在短暂交接窗口；有界重试后仍失败才回滚。
+curl -fsS --retry 5 --retry-delay 1 --retry-all-errors --max-time 5 \
+  "http://127.0.0.1:${HOST_PORT}/healthz" >/dev/null
 rm -f "$DRAIN_STATE"
 rm -f "$previous_config"
 release_succeeded=true

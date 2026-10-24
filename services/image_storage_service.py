@@ -96,8 +96,15 @@ def _read_json_object(path: Path) -> dict[str, object]:
 def _write_json_object(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    try:
+        # 生产图片索引已超过 150MB。逐块编码写入，避免 dumps 的片段列表、
+        # 完整 JSON 字符串和 UTF-8 副本同时驻留，叠加生成任务后触发容器 OOM。
+        with tmp_path.open("w", encoding="utf-8") as target:
+            json.dump(data, target, ensure_ascii=False, indent=2)
+            target.write("\n")
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 class WebDAVClient:

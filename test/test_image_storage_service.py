@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from PIL import Image
 
-from services.image_storage_service import ImageStorageService
+from services.image_storage_service import ImageStorageService, _write_json_object
 
 
 def png_bytes() -> bytes:
@@ -133,6 +135,32 @@ class ImageStorageServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
+
+    def test_large_index_serialization_has_bounded_extra_memory(self):
+        """索引写盘不能再创建与整个索引同大小的编码副本。"""
+        path = self.data_dir / "large-index.json"
+        data = {"items": {str(i): {"name": "测试图片", "metadata": "x" * 1024} for i in range(3000)}}
+        tracemalloc.start()
+        try:
+            _write_json_object(path, data)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertGreater(path.stat().st_size, 3 * 1024 * 1024)
+        self.assertLess(peak, 1024 * 1024)
+        with path.open(encoding="utf-8") as source:
+            self.assertEqual(json.load(source), data)
+        self.assertFalse(path.with_suffix(".json.tmp").exists())
+
+    def test_failed_index_encoding_preserves_previous_file(self):
+        """写盘失败时保留原索引并清理临时文件，不能丢失图片记录。"""
+        path = self.data_dir / "index.json"
+        path.write_text('{"items": {}}\n', encoding="utf-8")
+        original = path.read_bytes()
+        with self.assertRaises(TypeError):
+            _write_json_object(path, {"items": {"invalid": object()}})
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
 if __name__ == "__main__":
