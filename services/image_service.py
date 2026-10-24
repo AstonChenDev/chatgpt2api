@@ -135,14 +135,27 @@ def get_image_download_response(relative_path: str) -> FileResponse:
     )
 
 
-def cleanup_image_thumbnails() -> int:
+def cleanup_image_thumbnails(stop_event: threading.Event | None = None) -> int:
+    """批量检查缩略图，避免逐张反复解析大索引；排空时可在循环边界停止。"""
     thumbnails_root = config.image_thumbnails_dir
     removed = 0
+    candidates: list[tuple[Path, str]] = []
     for path in thumbnails_root.rglob("*"):
+        if stop_event is not None and stop_event.is_set():
+            return removed
         if not path.is_file():
             continue
         rel = path.relative_to(thumbnails_root).as_posix()
-        if not rel.endswith(".png") or not image_storage_service.exists(rel[:-4]):
+        candidates.append((path, rel))
+    if stop_event is not None and stop_event.is_set():
+        return removed
+    existing = image_storage_service.existing_relatives(
+        [rel[:-4] for _, rel in candidates if rel.endswith(".png")]
+    )
+    for path, rel in candidates:
+        if stop_event is not None and stop_event.is_set():
+            return removed
+        if not rel.endswith(".png") or rel[:-4] not in existing:
             path.unlink()
             removed += 1
     _cleanup_empty_dirs(thumbnails_root)
@@ -359,7 +372,7 @@ def _auto_cleanup_worker(stop_event: threading.Event) -> None:
     while not stop_event.wait(1800):  # 每30分钟
         try:
             config.cleanup_old_images()
-            cleanup_image_thumbnails()
+            cleanup_image_thumbnails(stop_event)
             usage = shutil.disk_usage(config.images_dir)
             free_mb = usage.free // (1024 * 1024)
             if free_mb < min_free_mb:

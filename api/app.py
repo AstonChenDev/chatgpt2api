@@ -100,7 +100,9 @@ def _deployment_supervisor(shutdown_event: Event) -> None:
                     background_running=True,
                     background_quiesced=False,
                 )
-        elif not should_run and workers is not None:
+        elif workers is not None and (not should_run or workers.stop_event.is_set()):
+            # 回滚可能重新把该槽设为 active；已经收到停止信号的线程仍须先退出，
+            # 再由下一轮创建新线程，否则 ready 会永久停留在 False。
             deployment_runtime.mark_transition(
                 ready=False,
                 background_running=False,

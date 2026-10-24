@@ -162,6 +162,24 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertFalse(path.with_suffix(".json.tmp").exists())
 
+    def test_batch_existence_reads_remote_index_only_once(self):
+        service = self.service()
+        self.images_dir.mkdir()
+        (self.images_dir / "local.png").write_bytes(png_bytes())
+        with mock.patch.object(service, "_load_clean_index", return_value={
+            "cos.png": {"cos": True},
+            "dav.jpg": {"webdav": True},
+        }) as load:
+            found = service.existing_relatives(["local.png", "cos.png", "dav.jpg", "missing.png"])
+        self.assertEqual(found, {"local.png", "cos.png", "dav.jpg"})
+        load.assert_called_once()
+
+    def test_empty_batch_does_not_load_image_index(self):
+        service = self.service()
+        with mock.patch.object(service, "_load_clean_index") as load:
+            self.assertEqual(service.existing_relatives([]), set())
+        load.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -333,6 +333,18 @@ class ImageStorageService:
         items = self._load_index()
         return {rel: item for rel, item in items.items() if _is_image_rel(rel)}
 
+    def existing_relatives(self, relatives: list[str]) -> set[str]:
+        """批量检查原图是否存在；同一批远程图片只读取一次索引。"""
+        safe = {_safe_relative_path(rel) for rel in relatives}
+        safe = {rel for rel in safe if _is_image_rel(rel)}
+        found = {rel for rel in safe if _local_image_path(rel).is_file()}
+        remote = safe - found
+        if remote:
+            indexed = self._load_clean_index()
+            found.update(rel for rel in remote
+                         if indexed.get(rel, {}).get("webdav") or indexed.get(rel, {}).get("cos"))
+        return found
+
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
         _write_json_object(self.index_file, {"items": items})
 

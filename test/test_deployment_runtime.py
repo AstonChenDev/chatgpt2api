@@ -2,8 +2,39 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+from unittest import mock
 
 from services import deployment_runtime as deployment_module
+
+
+def test_rollback_restarts_background_workers_after_drain(monkeypatch):
+    """排空中回滚为 active 后，应等待旧线程结束并重新启动后台服务。"""
+    from api import app as app_module
+
+    runtime = mock.Mock()
+    runtime.is_active.return_value = True
+    runtime.is_draining.side_effect = [False, True, False, False]
+    shutdown = mock.Mock()
+    shutdown.is_set.side_effect = [False, False, False, False, True]
+    old = mock.Mock()
+    old.stop_event = threading.Event()
+    old.request_stop.side_effect = old.stop_event.set
+    old.alive.side_effect = [True, False]
+    new = mock.Mock()
+    new.stop_event = threading.Event()
+    starter = mock.Mock(side_effect=[old, new])
+    monkeypatch.setattr(app_module, "deployment_runtime", runtime)
+    monkeypatch.setattr(app_module, "_start_background_workers", starter)
+
+    app_module._deployment_supervisor(shutdown)
+
+    assert starter.call_count == 2
+    assert all(call.kwargs == {"reload_shared_state": True} for call in starter.call_args_list)
+    assert old.stop_event.is_set()
+    ready = [call for call in runtime.mark_transition.call_args_list if call.kwargs["ready"]]
+    assert len(ready) == 2
+    new.join.assert_called_once_with(timeout=5)
 
 
 def _runtime(monkeypatch, tmp_path, slot: str = "blue"):
