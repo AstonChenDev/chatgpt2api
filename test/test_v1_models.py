@@ -38,6 +38,8 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("codex-gpt-image-2", ids)
         self.assertIn("gpt-image-2.5-flare", ids)
         self.assertIn("gpt-image-2.5-sunburst", ids)
+        self.assertIn("gpt-image-2.6-flare", ids)
+        self.assertIn("gpt-image-2.6-sunburst", ids)
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("pro-codex-gpt-image-2", ids)
@@ -64,6 +66,8 @@ class ModelListTests(unittest.TestCase):
         self.assertNotIn("codex-gpt-image-2", ids)
         self.assertNotIn("gpt-image-2.5-flare", ids)
         self.assertNotIn("gpt-image-2.5-sunburst", ids)
+        self.assertNotIn("gpt-image-2.6-flare", ids)
+        self.assertNotIn("gpt-image-2.6-sunburst", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
 
     def test_list_models_function(self):

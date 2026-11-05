@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 GPT_IMAGE_25_MODELS = {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
-CODEX_IMAGE_MODELS = {CODEX_IMAGE_MODEL} | GPT_IMAGE_25_MODELS
+GPT_IMAGE_26_MODELS = {"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"}
+GPT_IMAGE_TOOL_MODELS = GPT_IMAGE_25_MODELS | GPT_IMAGE_26_MODELS
+CODEX_IMAGE_MODELS = {CODEX_IMAGE_MODEL} | GPT_IMAGE_TOOL_MODELS
 BASE_IMAGE_MODELS = {"gpt-image-2"} | CODEX_IMAGE_MODELS
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
@@ -165,7 +167,7 @@ def codex_image_tool_model(model: object) -> str:
     """返回 Codex Responses 图片工具实际使用的模型名。"""
 
     _, base_model = split_image_model(model)
-    return base_model if base_model in GPT_IMAGE_25_MODELS else "gpt-image-2"
+    return base_model if base_model in GPT_IMAGE_TOOL_MODELS else "gpt-image-2"
 
 
 def is_image_chat_request(body: dict[str, object]) -> bool:

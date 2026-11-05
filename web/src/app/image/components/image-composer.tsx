@@ -127,7 +127,8 @@ export function ImageComposer({
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
   const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
-  const isCodexModel = imageModel.toLowerCase().includes("codex");
+  const normalizedImageModel = imageModel.toLowerCase();
+  const isCodexModel = normalizedImageModel.includes("codex") || /^gpt-image-2\.[56]-(flare|sunburst)$/.test(normalizedImageModel);
 
   useEffect(() => {
     if (!isSizeMenuOpen) {

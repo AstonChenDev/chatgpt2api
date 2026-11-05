@@ -13,7 +13,7 @@ from services.auth_service import AuthService
 from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
-from utils.helper import anonymize_token, codex_image_tool_model, is_codex_image_model, split_image_model
+from utils.helper import anonymize_token, codex_image_tool_model, is_codex_image_model, is_image_chat_request, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
@@ -84,6 +84,14 @@ class AccountCapabilityTests(unittest.TestCase):
         self.assertEqual(codex_image_tool_model("gpt-image-2.5-flare"), "gpt-image-2.5-flare")
         self.assertEqual(codex_image_tool_model("gpt-image-2.5-sunburst"), "gpt-image-2.5-sunburst")
         self.assertEqual(codex_image_tool_model("codex-gpt-image-2"), "gpt-image-2")
+
+    def test_gpt_image_26_models_use_codex_tool_route(self) -> None:
+        for model in ("gpt-image-2.6-flare", "gpt-image-2.6-sunburst"):
+            with self.subTest(model=model):
+                self.assertEqual(split_image_model(model), (None, model))
+                self.assertTrue(is_codex_image_model(model))
+                self.assertTrue(is_image_chat_request({"model": model}))
+                self.assertEqual(codex_image_tool_model(model), model)
 
     def test_get_available_access_token_filters_by_plan_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
